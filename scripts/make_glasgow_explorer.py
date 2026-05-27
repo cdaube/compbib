@@ -854,6 +854,29 @@ function connColor(n) {{
   return `rgb(${{r}},${{g}},40)`;
 }}
 
+function parseCssColor(color) {{
+  if (!color) return null;
+  const rgbMatch = color.match(/rgba?\\((\\d+),\\s*(\\d+),\\s*(\\d+)/i);
+  if (rgbMatch) {{
+    return rgbMatch.slice(1, 4).map(value => Math.max(0, Math.min(255, Number(value))));
+  }}
+  const hexMatch = color.match(/^#([0-9a-f]{{3}}|[0-9a-f]{{6}})$/i);
+  if (hexMatch) {{
+    let hex = hexMatch[1];
+    if (hex.length === 3) hex = hex.split('').map(ch => ch + ch).join('');
+    return [0, 2, 4].map(pos => parseInt(hex.slice(pos, pos + 2), 16));
+  }}
+  return null;
+}}
+
+function paleAuthorContextColor(color) {{
+  const rgb = parseCssColor(color);
+  if (!rgb) return color;
+  const grey = [203, 213, 225];
+  const mixed = rgb.map((channel, idx) => Math.round(channel * 0.5 + grey[idx] * 0.5));
+  return `rgb(${{mixed[0]}},${{mixed[1]}},${{mixed[2]}})`;
+}}
+
 function loadStoredSchoolColors() {{
   try {{
     const raw = localStorage.getItem(SCHOOL_COLOR_STORAGE_KEY);
@@ -1076,12 +1099,19 @@ function getCurrentMode() {{
 }}
 
 // ── colour assignment helpers ────────────────────────────────────
+function datumColor(d, mode, idx) {{
+  if (!isDatumVisible(d, mode, idx)) return 'rgba(0,0,0,0)';
+  let color = 'rgb(100,100,100)';
+  if (mode === 'school') color = SCHOOL_COLORS[d.school] || 'rgb(80,80,80)';
+  if (mode === 'college') color = COLLEGE_COLORS[d.college] || 'rgb(80,80,80)';
+  if (mode === 'year') color = yearColor(d.year_int);
+  if (mode === 'citations') color = SCHOOL_COLORS[d.school] || 'rgb(180,180,180)';
+  const isAuthorContext = activeAuthorName && !datumGlasgowAuthors[idx].includes(activeAuthorName);
+  return isAuthorContext ? paleAuthorContextColor(color) : color;
+}}
+
 function getColors(mode) {{
-  if (mode === 'school') return DATA.map(d => isDatumVisible(d, mode) ? (SCHOOL_COLORS[d.school] || 'rgb(80,80,80)') : 'rgba(0,0,0,0)');
-  if (mode === 'college') return DATA.map(d => isDatumVisible(d, mode) ? (COLLEGE_COLORS[d.college] || 'rgb(80,80,80)') : 'rgba(0,0,0,0)');
-  if (mode === 'year') return DATA.map(d => isDatumVisible(d, mode) ? yearColor(d.year_int) : 'rgba(0,0,0,0)');
-  if (mode === 'citations') return DATA.map(d => isDatumVisible(d, mode) ? (SCHOOL_COLORS[d.school] || 'rgb(180,180,180)') : 'rgba(0,0,0,0)');
-  return DATA.map(() => 'rgb(100,100,100)');
+  return DATA.map((d, idx) => datumColor(d, mode, idx));
 }}
 
 function getMarkerSizes() {{
@@ -1456,7 +1486,7 @@ function renderAuthorResultButton(summary) {{
 
 function setActiveAuthor(authorName) {{
   activeAuthorName = authorName || '';
-  Plotly.restyle('umap-plot', {{ 'marker.size': [getMarkerSizes()] }}, [0]);
+  Plotly.restyle('umap-plot', {{ 'marker.color': [getColors(getCurrentMode())], 'marker.size': [getMarkerSizes()] }}, [0]);
   renderAuthorResults();
 }}
 
