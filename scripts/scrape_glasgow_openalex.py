@@ -17,6 +17,8 @@ Usage:
 Optional:
   data/glasgow_author_overrides.csv with researcher_name,openalex_author_id
   can be used to resolve ambiguous people from glasgow_author_candidates.csv.
+  Optional columns profile_publications_url and doi_allowlist restrict works
+  for fragile/common-name author records.
 """
 
 from __future__ import annotations
@@ -105,6 +107,14 @@ def clean_doi(value: str | None) -> str:
     if not value:
         return ""
     return re.sub(r"^https?://doi\.org/", "", str(value), flags=re.I).strip()
+
+
+def normalize_doi(value: str | None) -> str:
+    doi = clean_doi(value)
+    if doi.lower() == "nan":
+        return ""
+    doi = doi.strip().strip(".,;)'\"")
+    return doi.lower()
 
 
 def pmid_from_ids(ids: dict[str, Any]) -> str:
@@ -292,6 +302,42 @@ def iter_author_works(author_id: str) -> list[dict[str, Any]]:
     return works
 
 
+def fetch_work_by_doi(doi: str) -> dict[str, Any] | None:
+    doi = normalize_doi(doi)
+    if not doi:
+        return None
+    try:
+        return fetch_json(
+            f"/works/doi:{doi}",
+            {
+                "select": (
+                    "id,doi,ids,display_name,title,publication_year,primary_location,"
+                    "authorships,abstract_inverted_index,type,cited_by_count,referenced_works"
+                ),
+            },
+        )
+    except Exception:
+        return None
+
+
+def profile_dois(url: str) -> set[str]:
+    """Extract DOI strings from a Glasgow staff publication page."""
+    if not url:
+        return set()
+    try:
+        import requests
+
+        resp = requests.get(url, params={"view": "pubs"}, timeout=45)
+        resp.raise_for_status()
+        text = resp.text
+    except Exception:
+        return set()
+    dois = set()
+    for match in re.findall(r"(?:doi:\s*|https?://doi\.org/)(10\.[^\s<>()]+)", text, flags=re.I):
+        dois.add(normalize_doi(html.unescape(match)))
+    return dois
+
+
 def source_name(work: dict[str, Any]) -> str:
     source = (work.get("primary_location") or {}).get("source") or {}
     return str(source.get("display_name") or "")
@@ -350,7 +396,7 @@ def write_author_candidates(rows: list[dict[str, Any]]) -> None:
         writer.writerows(rows)
 
 
-def load_author_overrides() -> dict[str, str]:
+def load_author_overrides() -> dict[str, dict[str, Any]]:
     """Load optional manual author resolutions keyed by researcher name."""
     if not os.path.exists(OVERRIDES_CSV):
         return {}
@@ -362,9 +408,29 @@ def load_author_overrides() -> dict[str, str]:
         name = str(row.get("researcher_name", "")).strip()
         author_id = str(row.get("openalex_author_id", "")).strip()
         if name and author_id and author_id.lower() != "nan":
-            overrides[normalize_name(name)] = author_id
-            overrides[normalize_name(clean_researcher_name(name))] = author_id
+            override = {
+                "author_id": author_id,
+                "profile_publications_url": str(row.get("profile_publications_url", "") or "").strip(),
+                "doi_allowlist": {
+                    normalize_doi(doi)
+                    for doi in re.split(r"[|;,\s]+", str(row.get("doi_allowlist", "") or ""))
+                    if normalize_doi(doi)
+                },
+            }
+            if override["profile_publications_url"] and override["profile_publications_url"].lower() != "nan":
+                override["doi_allowlist"].update(profile_dois(override["profile_publications_url"]))
+            overrides[normalize_name(name)] = override
+            overrides[normalize_name(clean_researcher_name(name))] = override
     return overrides
+
+
+def merge_unique_works(works: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_id = {}
+    for work in works:
+        work_id = short_openalex_id(work.get("id", ""))
+        if work_id:
+            by_id[work_id] = work
+    return list(by_id.values())
 
 
 def assert_can_write(paths: list[str], overwrite: bool) -> None:
@@ -393,10 +459,12 @@ def scrape(overwrite: bool = False) -> None:
     unresolved: list[str] = []
 
     for researcher in tqdm(researchers, desc="Authors"):
-        override_id = overrides.get(normalize_name(researcher["name"]))
-        if override_id:
+        override = overrides.get(normalize_name(researcher["name"]))
+        doi_allowlist: set[str] = set()
+        if override:
+            doi_allowlist = set(override.get("doi_allowlist", set()))
             selected = {
-                "id": override_id,
+                "id": override["author_id"],
                 "display_name": researcher["name"],
                 "_rank": "override",
                 "_score": "override",
@@ -432,6 +500,18 @@ def scrape(overwrite: bool = False) -> None:
             continue
 
         works = iter_author_works(selected["id"])
+        if doi_allowlist:
+            doi_works = [fetch_work_by_doi(doi) for doi in sorted(doi_allowlist)]
+            works = merge_unique_works(works + [work for work in doi_works if work])
+            before_filter = len(works)
+            works = [
+                work for work in works
+                if normalize_doi((work.get("doi") or (work.get("ids") or {}).get("doi"))) in doi_allowlist
+            ]
+            print(
+                f"  DOI allowlist for {researcher['name']}: "
+                f"retained {len(works)}/{before_filter} OpenAlex works"
+            )
         for work in works:
             row = work_row(work)
             if not row["paper_id"] or not row["title"]:
