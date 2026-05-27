@@ -174,6 +174,24 @@ def clean(value):
     return str(value).strip()
 
 
+def clean_identifier(value):
+    if pd.isna(value):
+        return ""
+    text = str(value).strip()
+    if text.endswith(".0") and text[:-2].isdigit():
+        return text[:-2]
+    return text
+
+
+def clean_year(value):
+    if pd.isna(value):
+        return ""
+    year = pd.to_numeric(value, errors="coerce")
+    if pd.notna(year):
+        return str(int(year))
+    return clean(value)
+
+
 def normalize_school(value):
     cleaned = clean(value)
     if not cleaned:
@@ -292,9 +310,15 @@ def main():
     df = pd.read_csv(os.path.join(DATA_DIR, "glasgow_abstracts.csv"))
     authors = pd.read_csv(os.path.join(DATA_DIR, "glasgow_authors.csv"))
     coords = np.load(os.path.join(DATA_DIR, "glasgow_umap_coords.npy"))
+    id_col = "paper_id" if "paper_id" in df.columns else "pmid"
+    author_id_col = "paper_id" if "paper_id" in authors.columns else "pmid"
 
     if len(df) != len(coords):
-        raise ValueError("Length mismatch between abstracts and UMAP coords.")
+        raise ValueError(
+            "Length mismatch between abstracts and UMAP coords: "
+            f"{len(df)} papers vs {len(coords)} coords. "
+            "Run scripts/build_glasgow_explorer_data.py to regenerate embeddings and UMAPs."
+        )
 
     # ------------------------------------------------------------------
     # 1b. Load or compute multi-UMAP (10 projections with different seeds)
@@ -330,8 +354,8 @@ def main():
     df["x"] = df["_ux0"]
     df["y"] = df["_uy0"]
     df["year_int"] = pd.to_numeric(df["year"], errors="coerce")
-    df["pmid"] = df["pmid"].astype(str)
-    authors["pmid"] = authors["pmid"].astype(str)
+    df[id_col] = df[id_col].astype(str)
+    authors[author_id_col] = authors[author_id_col].astype(str)
     authors["school"] = authors["school"].map(normalize_school)
     authors = authors[authors["school"].isin(SCHOOL_ORDER)].copy()
 
@@ -339,25 +363,37 @@ def main():
         raise ValueError("No Glasgow authors remain after school normalization/filtering.")
 
     # Citations
+    if "cited_by_count" in df.columns:
+        df.drop(columns=["cited_by_count"], inplace=True)
     cit_file = os.path.join(DATA_DIR, "glasgow_citations.csv")
     if os.path.exists(cit_file):
         cit = pd.read_csv(cit_file)
-        cit["pmid"] = cit["pmid"].astype(str)
-        df = df.merge(cit[["pmid", "cited_by_count"]], on="pmid", how="left")
+        cit_id_col = "paper_id" if "paper_id" in cit.columns else "pmid"
+        cit[cit_id_col] = cit[cit_id_col].astype(str)
+        df = df.merge(
+            cit[[cit_id_col, "cited_by_count"]],
+            left_on=id_col,
+            right_on=cit_id_col,
+            how="left",
+        )
+        if cit_id_col != id_col:
+            df.drop(columns=[cit_id_col], inplace=True)
         df["cited_by_count"] = df["cited_by_count"].fillna(0).astype(int)
     else:
         df["cited_by_count"] = 0
 
     # Author/school/college aggregation
-    agg = authors.groupby("pmid").agg(
+    agg = authors.groupby(author_id_col).agg(
         glasgow_authors=("author_name", lambda x: "; ".join(sorted(set(x)))),
         schools=("school", lambda x: "; ".join(sorted(set(x), key=school_sort_key))),
         colleges=("college", lambda x: "; ".join(sorted(set(x)))),
         primary_college=("college", "first"),
         primary_school=("school", "first"),
     ).reset_index()
-    agg["pmid"] = agg["pmid"].astype(str)
-    df = df.merge(agg, on="pmid", how="inner")
+    agg[author_id_col] = agg[author_id_col].astype(str)
+    df = df.merge(agg, left_on=id_col, right_on=author_id_col, how="inner")
+    if author_id_col != id_col:
+        df.drop(columns=[author_id_col], inplace=True)
     print(f"  Retained {len(df)} papers across {agg['primary_school'].nunique()} schools")
 
     # Citation graph edges
@@ -365,8 +401,16 @@ def main():
     edges_json = "[]"
     if os.path.exists(graph_file):
         edges = pd.read_csv(graph_file, dtype=str)
-        edges_json = edges.to_json(orient="values")
-        print(f"  Citation graph: {len(edges)} edges")
+        if {"citing_paper_id", "cited_paper_id"}.issubset(edges.columns):
+            edges = edges[["citing_paper_id", "cited_paper_id"]]
+            edges_json = edges.to_json(orient="values")
+            print(f"  Citation graph: {len(edges)} edges")
+        elif id_col == "pmid" and {"citing_pmid", "cited_pmid"}.issubset(edges.columns):
+            edges = edges[["citing_pmid", "cited_pmid"]]
+            edges_json = edges.to_json(orient="values")
+            print(f"  Citation graph: {len(edges)} edges")
+        else:
+            print("  Citation graph cache is incompatible with current paper IDs; ignoring.")
 
     # ------------------------------------------------------------------
     # 2. Build colour maps
@@ -382,9 +426,11 @@ def main():
         records.append({
             "x": float(row["x"]),
             "y": float(row["y"]),
-            "pmid": clean(row["pmid"]),
+            "paper_id": clean_identifier(row[id_col]),
+            "pmid": clean_identifier(row.get("pmid", "")),
+            "openalex_id": clean_identifier(row.get("openalex_id", "")),
             "title": clean(row.get("title", "")),
-            "year": clean(row.get("year", "")),
+            "year": clean_year(row.get("year", "")),
             "journal": clean(row.get("journal", "")),
             "doi": clean(row.get("doi", "")),
             "abstract": clean(row.get("abstract", "")),
@@ -697,12 +743,12 @@ let interactionMode = 'pan';
 const imagingMask = DATA.map(d => IMAGING_REGEX.test(d.abstract || ''));
 
 // pre-index
-const pmidIdx = {{}};
-DATA.forEach((d, i) => {{ pmidIdx[d.pmid] = i; }});
+const paperIdx = {{}};
+DATA.forEach((d, i) => {{ paperIdx[d.paper_id] = i; }});
 
 // citation adjacency
-const citesOut = {{}};   // pmid -> [pmid, ...]
-const citedBy = {{}};    // pmid -> [pmid, ...]
+const citesOut = {{}};   // paper_id -> [paper_id, ...]
+const citedBy = {{}};    // paper_id -> [paper_id, ...]
 EDGES.forEach(e => {{
   const [a, b] = e;
   if (!citesOut[a]) citesOut[a] = [];
@@ -727,7 +773,7 @@ function yearColor(y) {{
 
 // citation connection count
 const connCount = DATA.map(d => {{
-  return (citesOut[d.pmid] || []).length + (citedBy[d.pmid] || []).length;
+  return (citesOut[d.paper_id] || []).length + (citedBy[d.paper_id] || []).length;
 }});
 const maxConn = Math.max(1, ...connCount);
 function connColor(n) {{
@@ -923,7 +969,7 @@ function isYearVisible(year) {{
 
 function isDatumVisible(d, mode, idx = null) {{
   if (!isSchoolVisible(d.school)) return false;
-  const index = idx ?? pmidIdx[d.pmid];
+  const index = idx ?? paperIdx[d.paper_id];
   if (imagingOnlyEnabled && (index === undefined || !imagingMask[index])) return false;
   if (mode === 'college') return isCollegeVisible(d.college);
   if (mode === 'year') return isYearVisible(d.year_int);
@@ -1010,28 +1056,28 @@ function clearEdges() {{
   }}
 }}
 
-function isEdgeVisible(sourcePmid, targetPmid) {{
+function isEdgeVisible(sourcePaperId, targetPaperId) {{
   const mode = getCurrentMode();
-  const sourceIdx = pmidIdx[sourcePmid];
-  const targetIdx = pmidIdx[targetPmid];
+  const sourceIdx = paperIdx[sourcePaperId];
+  const targetIdx = paperIdx[targetPaperId];
   if (sourceIdx === undefined || targetIdx === undefined) return false;
   return isDatumVisible(DATA[sourceIdx], mode) && isDatumVisible(DATA[targetIdx], mode);
 }}
 
-function buildSelectedEdgeTraces(pmid) {{
-  const srcIdx = pmidIdx[pmid];
+function buildSelectedEdgeTraces(paperId) {{
+  const srcIdx = paperIdx[paperId];
   if (srcIdx === undefined || !isDatumVisible(DATA[srcIdx], getCurrentMode(), srcIdx)) return [];
 
   const sx = DATA[srcIdx].x;
   const sy = DATA[srcIdx].y;
   const traces = [];
 
-  const outs = citesOut[pmid] || [];
+  const outs = citesOut[paperId] || [];
   if (outs.length) {{
     const ex = [], ey = [];
     outs.forEach(t => {{
-      const ti = pmidIdx[t];
-      if (ti !== undefined && isEdgeVisible(pmid, t)) {{
+      const ti = paperIdx[t];
+      if (ti !== undefined && isEdgeVisible(paperId, t)) {{
         ex.push(sx, DATA[ti].x, null);
         ey.push(sy, DATA[ti].y, null);
       }}
@@ -1043,12 +1089,12 @@ function buildSelectedEdgeTraces(pmid) {{
     }});
   }}
 
-  const ins = citedBy[pmid] || [];
+  const ins = citedBy[paperId] || [];
   if (ins.length) {{
     const ex = [], ey = [];
     ins.forEach(s => {{
-      const si = pmidIdx[s];
-      if (si !== undefined && isEdgeVisible(s, pmid)) {{
+      const si = paperIdx[s];
+      if (si !== undefined && isEdgeVisible(s, paperId)) {{
         ex.push(DATA[si].x, sx, null);
         ey.push(DATA[si].y, sy, null);
       }}
@@ -1063,24 +1109,24 @@ function buildSelectedEdgeTraces(pmid) {{
   return traces;
 }}
 
-function drawSelectedEdges(pmid) {{
+function drawSelectedEdges(paperId) {{
   clearEdges();
-  const traces = buildSelectedEdgeTraces(pmid);
+  const traces = buildSelectedEdgeTraces(paperId);
   if (traces.length) {{
     Plotly.addTraces('umap-plot', traces);
     edgeTraceCount = traces.length;
   }}
 }}
 
-function drawCitationNetwork(selectedPmid = null) {{
+function drawCitationNetwork(selectedPaperId = null) {{
   clearEdges();
   const ex = [];
   const ey = [];
   EDGES.forEach(e => {{
     const [source, target] = e;
     if (!isEdgeVisible(source, target)) return;
-    const sourceIdx = pmidIdx[source];
-    const targetIdx = pmidIdx[target];
+    const sourceIdx = paperIdx[source];
+    const targetIdx = paperIdx[target];
     ex.push(DATA[sourceIdx].x, DATA[targetIdx].x, null);
     ey.push(DATA[sourceIdx].y, DATA[targetIdx].y, null);
   }});
@@ -1094,8 +1140,8 @@ function drawCitationNetwork(selectedPmid = null) {{
     }});
   }}
 
-  if (selectedPmid) {{
-    traces.push(...buildSelectedEdgeTraces(selectedPmid));
+  if (selectedPaperId) {{
+    traces.push(...buildSelectedEdgeTraces(selectedPaperId));
   }}
 
   if (traces.length) {{
@@ -1213,7 +1259,7 @@ function applyColourState() {{
   Plotly.restyle('umap-plot', {{ 'marker.color': [getColors(mode)], 'marker.size': [getMarkerSizes()] }}, [0]);
   renderLegend(mode);
   if (citationNetworkEnabled) {{
-    drawCitationNetwork(selectedPointIndex !== null ? DATA[selectedPointIndex].pmid : null);
+    drawCitationNetwork(selectedPointIndex !== null ? DATA[selectedPointIndex].paper_id : null);
   }} else {{
     clearEdges();
   }}
@@ -1357,9 +1403,9 @@ function switchProjection(projIdx) {{
   DATA.forEach((d, i) => {{ d.x = newXs[i]; d.y = newYs[i]; }});
   Plotly.restyle('umap-plot', {{ x: [newXs], y: [newYs] }}, [0]);
   if (citationNetworkEnabled) {{
-    drawCitationNetwork(selectedPointIndex !== null ? DATA[selectedPointIndex].pmid : null);
+    drawCitationNetwork(selectedPointIndex !== null ? DATA[selectedPointIndex].paper_id : null);
   }} else if (selectedPointIndex !== null) {{
-    drawSelectedEdges(DATA[selectedPointIndex].pmid);
+    drawSelectedEdges(DATA[selectedPointIndex].paper_id);
   }} else {{
     clearEdges();
   }}
@@ -1415,11 +1461,14 @@ function esc(v) {{
 function renderDetail(d) {{
   const schoolColor = SCHOOL_COLORS[d.school] || '#475569';
   const doi = d.doi ? `<a href="https://doi.org/${{esc(d.doi)}}" target="_blank" rel="noopener">${{esc(d.doi)}}</a>` : 'N/A';
+  const oaLink = d.openalex_id
+    ? `<a href="https://openalex.org/${{esc(d.openalex_id)}}" target="_blank" rel="noopener">${{esc(d.openalex_id)}}</a>`
+    : 'N/A';
   const pmLink = d.pmid && d.pmid !== 'nan'
     ? `<a href="https://pubmed.ncbi.nlm.nih.gov/${{esc(d.pmid)}}/" target="_blank" rel="noopener">${{esc(d.pmid)}}</a>`
     : 'N/A';
-  const nOut = (citesOut[d.pmid] || []).length;
-  const nIn  = (citedBy[d.pmid] || []).length;
+  const nOut = (citesOut[d.paper_id] || []).length;
+  const nIn  = (citedBy[d.paper_id] || []).length;
 
   detailEl.innerHTML = `
     <div class="paper-card" style="border-left-color:${{schoolColor}}">
@@ -1432,6 +1481,7 @@ function renderDetail(d) {{
       <div class="meta-row"><strong>College:</strong> ${{esc(d.college) || '?'}}</div>
       <div class="meta-row"><strong>Total citations:</strong> ${{d.cited_by_count}}</div>
       <div class="meta-row"><strong>Cites in dataset:</strong> ${{nOut}} &nbsp; <strong>Cited by in dataset:</strong> ${{nIn}}</div>
+      <div class="meta-row"><strong>OpenAlex:</strong> ${{oaLink}}</div>
       <div class="meta-row"><strong>PMID:</strong> ${{pmLink}}</div>
       <div class="meta-row"><strong>DOI:</strong> ${{doi}}</div>
       <div class="abstract-text">${{esc(d.abstract) || 'No abstract available.'}}</div>
@@ -1450,7 +1500,7 @@ plot.on('plotly_click', ev => {{
   setPanelHidden(false);
   renderDetail(d);
   if (citationNetworkEnabled) {{
-    drawCitationNetwork(d.pmid);
+    drawCitationNetwork(d.paper_id);
   }} else {{
     clearEdges();
   }}
