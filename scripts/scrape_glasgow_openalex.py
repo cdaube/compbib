@@ -10,6 +10,9 @@ Outputs:
   data/glasgow_authors.csv            spreadsheet author to paper mapping
   data/glasgow_citations.csv          citation counts from OpenAlex
   data/glasgow_author_candidates.csv  author-resolution audit trail
+  data/glasgow_candidate_works.csv    all fetched author/work candidates
+  data/glasgow_work_evidence.csv      per-candidate include/quarantine/exclude evidence
+  data/glasgow_rejected_works.csv     rejected or quarantined candidates
 
 Usage:
     uv run python scripts/scrape_glasgow_openalex.py --overwrite
@@ -17,8 +20,10 @@ Usage:
 Optional:
   data/glasgow_author_overrides.csv with researcher_name,openalex_author_id
   can be used to resolve ambiguous people from glasgow_author_candidates.csv.
-  Optional columns profile_publications_url and doi_allowlist restrict works
-  for fragile/common-name author records.
+  Optional columns profile_publications_url and doi_allowlist add positive
+  evidence for fragile/common-name author records. doi_allowlist is treated as
+  hard include evidence; Glasgow profile publications are not used as a
+  complete ground truth.
 """
 
 from __future__ import annotations
@@ -26,6 +31,7 @@ from __future__ import annotations
 import argparse
 import csv
 import html
+import json
 import os
 import re
 import time
@@ -49,8 +55,13 @@ AUTHORS_CSV = os.path.join(DATA_DIR, "glasgow_authors.csv")
 CITATIONS_CSV = os.path.join(DATA_DIR, "glasgow_citations.csv")
 CANDIDATES_CSV = os.path.join(DATA_DIR, "glasgow_author_candidates.csv")
 OVERRIDES_CSV = os.path.join(DATA_DIR, "glasgow_author_overrides.csv")
+CANDIDATE_WORKS_CSV = os.path.join(DATA_DIR, "glasgow_candidate_works.csv")
+WORK_EVIDENCE_CSV = os.path.join(DATA_DIR, "glasgow_work_evidence.csv")
+REJECTED_WORKS_CSV = os.path.join(DATA_DIR, "glasgow_rejected_works.csv")
+ORCID_CACHE = os.path.join(DATA_DIR, ".glasgow_orcid_cache.json")
 
 OPENALEX_BASE = "https://api.openalex.org"
+ORCID_BASE = "https://pub.orcid.org/v3.0"
 POLITE_EMAIL = "christoph.daube@gmail.com"
 GLASGOW_ROR = "https://ror.org/00vtgdb53"
 
@@ -58,6 +69,21 @@ REQUEST_SLEEP = 0.1
 MAX_RETRIES = 5
 WORKS_PER_PAGE = 200
 AUTHOR_CANDIDATES = 10
+
+TRUSTED_DOI_INCLUDE_SCORE = 70
+WORK_AFFILIATION_INCLUDE_SCORE = 45
+COAUTHOR_INCLUDE_SCORE = 35
+QUARANTINE_SCORE = 20
+CAREER_START_GRACE_YEARS = 3
+ORCID_EARLIEST_GRACE_YEARS = 12
+NON_PUBLICATION_TYPES = {
+    "dataset",
+    "peer-review",
+    "supplementary-materials",
+    "erratum",
+    "reference-entry",
+    "other",
+}
 
 
 def normalize_name(value: str) -> str:
@@ -117,6 +143,35 @@ def normalize_doi(value: str | None) -> str:
     return doi.lower()
 
 
+def normalize_orcid(value: str | None) -> str:
+    if not value:
+        return ""
+    match = re.search(r"(\d{4}-\d{4}-\d{4}-[\dX]{4})", str(value), flags=re.I)
+    return match.group(1).upper() if match else ""
+
+
+def compact_title(value: str | None) -> str:
+    value = html.unescape(str(value or "")).lower()
+    value = unicodedata.normalize("NFKD", value)
+    value = "".join(ch for ch in value if not unicodedata.combining(ch))
+    value = re.sub(r"[^a-z0-9]+", " ", value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def safe_int(value: Any) -> int | None:
+    try:
+        if value is None or pd.isna(value):
+            return None
+    except TypeError:
+        if value is None:
+            return None
+    text = str(value).strip()
+    if not text or text.lower() == "nan":
+        return None
+    match = re.search(r"\d{4}", text)
+    return int(match.group(0)) if match else None
+
+
 def pmid_from_ids(ids: dict[str, Any]) -> str:
     pmid = ids.get("pmid", "")
     return str(pmid).rstrip("/").split("/")[-1] if pmid else ""
@@ -147,6 +202,155 @@ def fetch_json(path: str, params: dict[str, Any] | None = None) -> dict[str, Any
                 raise
             time.sleep(2 ** (attempt + 1))
     raise RuntimeError("unreachable")
+
+
+def fetch_openalex_author(author_id: str) -> dict[str, Any] | None:
+    short_id = short_openalex_id(author_id)
+    if not short_id:
+        return None
+    try:
+        return fetch_json(
+            f"/authors/{short_id}",
+            {
+                "select": (
+                    "id,display_name,orcid,works_count,cited_by_count,"
+                    "last_known_institutions,affiliations"
+                ),
+            },
+        )
+    except Exception:
+        return None
+
+
+def load_orcid_cache() -> dict[str, Any]:
+    if not os.path.exists(ORCID_CACHE):
+        return {}
+    try:
+        with open(ORCID_CACHE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_orcid_cache(cache: dict[str, Any]) -> None:
+    with open(ORCID_CACHE, "w", encoding="utf-8") as f:
+        json.dump(cache, f, indent=2, sort_keys=True)
+        f.write("\n")
+
+
+def fetch_orcid_record(orcid: str, cache: dict[str, Any]) -> dict[str, Any]:
+    """Fetch a public ORCID record summary, cached between scraper runs."""
+    orcid = normalize_orcid(orcid)
+    if not orcid:
+        return {}
+    if orcid in cache:
+        return cache[orcid] or {}
+    try:
+        resp = requests.get(
+            f"{ORCID_BASE}/{orcid}/record",
+            headers={"Accept": "application/json"},
+            timeout=45,
+        )
+        resp.raise_for_status()
+        cache[orcid] = resp.json()
+    except Exception:
+        cache[orcid] = {}
+    time.sleep(REQUEST_SLEEP)
+    return cache[orcid] or {}
+
+
+def nested_value(value: Any, *keys: str) -> Any:
+    current = value
+    for key in keys:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current
+
+
+def orcid_work_summaries(record: dict[str, Any]) -> list[dict[str, Any]]:
+    works = nested_value(record, "activities-summary", "works", "group") or []
+    summaries = []
+    for group in works:
+        summaries.extend(group.get("work-summary") or [])
+    return summaries
+
+
+def orcid_external_dois(summary: dict[str, Any]) -> set[str]:
+    dois = set()
+    external_ids = nested_value(summary, "external-ids", "external-id") or []
+    for ext_id in external_ids:
+        ext_type = str(ext_id.get("external-id-type") or "").lower()
+        ext_value = str(ext_id.get("external-id-value") or "")
+        if ext_type == "doi":
+            doi = normalize_doi(ext_value)
+            if doi:
+                dois.add(doi)
+    return dois
+
+
+def orcid_summary_title(summary: dict[str, Any]) -> str:
+    return str(nested_value(summary, "title", "title", "value") or "")
+
+
+def orcid_summary_year(summary: dict[str, Any]) -> int | None:
+    return safe_int(nested_value(summary, "publication-date", "year", "value"))
+
+
+def orcid_affiliation_summaries(record: dict[str, Any], section: str) -> list[dict[str, Any]]:
+    groups = nested_value(record, "activities-summary", section, "affiliation-group") or []
+    summaries = []
+    for group in groups:
+        for item in group.get("summaries") or []:
+            if isinstance(item, dict):
+                summaries.extend(value for value in item.values() if isinstance(value, dict))
+    return summaries
+
+
+def orcid_affiliation_names(record: dict[str, Any]) -> set[str]:
+    names = set()
+    for section in ("employments", "educations", "qualifications"):
+        for summary in orcid_affiliation_summaries(record, section):
+            name = nested_value(summary, "organization", "name")
+            if name:
+                names.add(normalize_name(str(name)))
+    return names
+
+
+def orcid_career_start_year(record: dict[str, Any]) -> int | None:
+    years = []
+    for section in ("employments", "educations", "qualifications"):
+        for summary in orcid_affiliation_summaries(record, section):
+            year = safe_int(nested_value(summary, "start-date", "year", "value"))
+            if year:
+                years.append(year)
+    return min(years) if years else None
+
+
+def orcid_profile(orcid: str, cache: dict[str, Any]) -> dict[str, Any]:
+    record = fetch_orcid_record(orcid, cache)
+    summaries = orcid_work_summaries(record)
+    dois: set[str] = set()
+    titles: set[str] = set()
+    years: list[int] = []
+    for summary in summaries:
+        dois.update(orcid_external_dois(summary))
+        title = compact_title(orcid_summary_title(summary))
+        if title:
+            titles.add(title)
+        year = orcid_summary_year(summary)
+        if year:
+            years.append(year)
+    return {
+        "orcid": normalize_orcid(orcid),
+        "work_dois": dois,
+        "work_titles": titles,
+        "work_years": years,
+        "earliest_work_year": min(years) if years else None,
+        "career_start_year": orcid_career_start_year(record),
+        "affiliation_names": orcid_affiliation_names(record),
+        "works_count": len(summaries),
+    }
 
 
 def glasgow_institution_id() -> str:
@@ -353,6 +557,261 @@ def author_names(work: dict[str, Any]) -> str:
     return "; ".join(names)
 
 
+def work_title(work: dict[str, Any]) -> str:
+    return html.unescape(str(work.get("display_name") or work.get("title") or ""))
+
+
+def work_doi(work: dict[str, Any]) -> str:
+    ids = work.get("ids") or {}
+    return normalize_doi(work.get("doi") or ids.get("doi"))
+
+
+def work_year(work: dict[str, Any]) -> int | None:
+    return safe_int(work.get("publication_year"))
+
+
+def work_pmid(work: dict[str, Any]) -> str:
+    return pmid_from_ids(work.get("ids") or {})
+
+
+def authorships(work: dict[str, Any]) -> list[dict[str, Any]]:
+    return list(work.get("authorships") or [])
+
+
+def authorship_author_id(authorship: dict[str, Any]) -> str:
+    return short_openalex_id((authorship.get("author") or {}).get("id", ""))
+
+
+def authorship_author_name(authorship: dict[str, Any]) -> str:
+    return str((authorship.get("author") or {}).get("display_name") or "")
+
+
+def selected_authorships(work: dict[str, Any], selected_author_id: str, researcher_name: str) -> list[dict[str, Any]]:
+    selected_id = short_openalex_id(selected_author_id)
+    matched = [
+        authorship for authorship in authorships(work)
+        if selected_id and authorship_author_id(authorship) == selected_id
+    ]
+    if matched:
+        return matched
+    return [
+        authorship for authorship in authorships(work)
+        if initial_last_match(researcher_name, authorship_author_name(authorship))
+    ]
+
+
+def authorship_institution_names(authorship: dict[str, Any]) -> list[str]:
+    names = []
+    for inst in authorship.get("institutions") or []:
+        names.append(str(inst.get("display_name", "")))
+        names.append(str(inst.get("ror", "")))
+        names.append(short_openalex_id(inst.get("id", "")))
+    for raw in authorship.get("raw_affiliation_strings") or []:
+        names.append(str(raw))
+    return [name for name in names if name]
+
+
+def work_has_glasgow_author_affiliation(
+    work: dict[str, Any],
+    selected_author_id: str,
+    researcher_name: str,
+    glasgow_id: str,
+) -> bool:
+    for authorship in selected_authorships(work, selected_author_id, researcher_name):
+        names = authorship_institution_names(authorship)
+        joined = " | ".join(names).lower()
+        if glasgow_id in names or GLASGOW_ROR.lower() in joined or "university of glasgow" in joined:
+            return True
+    return False
+
+
+def work_has_any_glasgow_affiliation(work: dict[str, Any], glasgow_id: str) -> bool:
+    for authorship in authorships(work):
+        names = authorship_institution_names(authorship)
+        joined = " | ".join(names).lower()
+        if glasgow_id in names or GLASGOW_ROR.lower() in joined or "university of glasgow" in joined:
+            return True
+    return False
+
+
+def work_has_known_orcid_affiliation(
+    work: dict[str, Any],
+    selected_author_id: str,
+    researcher_name: str,
+    known_affiliations: set[str],
+) -> bool:
+    if not known_affiliations:
+        return False
+    for authorship in selected_authorships(work, selected_author_id, researcher_name):
+        names = {normalize_name(name) for name in authorship_institution_names(authorship)}
+        for known in known_affiliations:
+            if known in names or any(known and known in name for name in names):
+                return True
+    return False
+
+
+def normalized_coauthors(work: dict[str, Any], researcher_name: str) -> set[str]:
+    names = set()
+    researcher = normalize_name(researcher_name)
+    for authorship in authorships(work):
+        name = normalize_name(authorship_author_name(authorship))
+        if name and name != researcher:
+            names.add(name)
+    return names
+
+
+def build_trusted_coauthors(
+    works: list[dict[str, Any]],
+    researcher_name: str,
+    trusted_dois: set[str],
+    trusted_titles: set[str],
+) -> set[str]:
+    coauthors: set[str] = set()
+    for work in works:
+        doi = work_doi(work)
+        title = compact_title(work_title(work))
+        if (doi and doi in trusted_dois) or (title and title in trusted_titles):
+            coauthors.update(normalized_coauthors(work, researcher_name))
+    return coauthors
+
+
+def score_work_identity(
+    *,
+    work: dict[str, Any],
+    researcher: dict[str, str],
+    selected_author_id: str,
+    selected_orcid: str,
+    glasgow_id: str,
+    explicit_dois: set[str],
+    profile_dois_set: set[str],
+    orcid_info: dict[str, Any],
+    trusted_coauthors: set[str],
+) -> dict[str, Any]:
+    doi = work_doi(work)
+    title = compact_title(work_title(work))
+    year = work_year(work)
+    work_type = str(work.get("type") or "").strip().lower()
+    flags: list[str] = []
+    score = 0
+
+    orcid_dois = set(orcid_info.get("work_dois") or set())
+    orcid_titles = set(orcid_info.get("work_titles") or set())
+    career_start = orcid_info.get("career_start_year")
+    earliest_orcid_work = orcid_info.get("earliest_work_year")
+    known_orcid_affiliations = set(orcid_info.get("affiliation_names") or set())
+
+    trusted_doi = False
+    if doi and doi in explicit_dois:
+        score += 100
+        trusted_doi = True
+        flags.append("manual_doi_allowlist")
+    if doi and doi in orcid_dois:
+        score += TRUSTED_DOI_INCLUDE_SCORE
+        trusted_doi = True
+        flags.append("orcid_doi")
+    if title and title in orcid_titles:
+        score += TRUSTED_DOI_INCLUDE_SCORE
+        trusted_doi = True
+        flags.append("orcid_title")
+    if doi and doi in profile_dois_set:
+        score += 55
+        trusted_doi = True
+        flags.append("profile_doi")
+
+    selected_name_match = any(
+        initial_last_match(researcher["name"], authorship_author_name(authorship))
+        for authorship in selected_authorships(work, selected_author_id, researcher["name"])
+    )
+    if selected_name_match:
+        score += 8
+        flags.append("selected_author_name_match")
+
+    if work_has_glasgow_author_affiliation(work, selected_author_id, researcher["name"], glasgow_id):
+        score += WORK_AFFILIATION_INCLUDE_SCORE
+        flags.append("selected_author_glasgow_affiliation")
+    elif work_has_known_orcid_affiliation(
+        work,
+        selected_author_id,
+        researcher["name"],
+        known_orcid_affiliations,
+    ):
+        score += 30
+        flags.append("selected_author_known_orcid_affiliation")
+    elif work_has_any_glasgow_affiliation(work, glasgow_id):
+        score += 18
+        flags.append("some_author_glasgow_affiliation")
+
+    pmid = work_pmid(work)
+    if pmid:
+        score += 8
+        flags.append("has_pmid")
+        if work_has_any_glasgow_affiliation(work, glasgow_id):
+            score += 15
+            flags.append("pubmed_like_with_glasgow_affiliation")
+
+    coauthors = normalized_coauthors(work, researcher["name"])
+    overlap = coauthors & trusted_coauthors
+    if len(overlap) >= 2:
+        score += COAUTHOR_INCLUDE_SCORE
+        flags.append(f"trusted_coauthor_overlap:{len(overlap)}")
+    elif len(overlap) == 1:
+        score += 15
+        flags.append("trusted_coauthor_overlap:1")
+
+    if selected_orcid:
+        flags.append("selected_author_has_orcid")
+        score += 2
+
+    hard_exclude = False
+    if year and career_start and year < career_start - CAREER_START_GRACE_YEARS and not trusted_doi:
+        hard_exclude = True
+        score -= 100
+        flags.append(f"predates_orcid_career_start:{career_start}")
+    elif year and earliest_orcid_work and year < earliest_orcid_work - ORCID_EARLIEST_GRACE_YEARS and not trusted_doi:
+        hard_exclude = True
+        score -= 75
+        flags.append(f"predates_orcid_work_span:{earliest_orcid_work}")
+
+    if not doi and not pmid and not trusted_doi:
+        score -= 10
+        flags.append("no_doi_or_pmid")
+
+    if work_type in NON_PUBLICATION_TYPES and not (doi and doi in explicit_dois):
+        decision = "exclude"
+        score -= 60
+        flags.append(f"non_publication_type:{work_type}")
+    elif trusted_doi:
+        decision = "include"
+    elif hard_exclude:
+        decision = "exclude"
+    elif score >= WORK_AFFILIATION_INCLUDE_SCORE:
+        decision = "include"
+    elif score >= QUARANTINE_SCORE:
+        decision = "quarantine"
+    else:
+        decision = "exclude"
+
+    return {
+        "researcher_name": researcher["name"],
+        "school": researcher["school"],
+        "college": researcher["college"],
+        "paper_id": short_openalex_id(work.get("id", "")),
+        "openalex_id": short_openalex_id(work.get("id", "")),
+        "pmid": pmid,
+        "doi": clean_doi(work.get("doi") or (work.get("ids") or {}).get("doi")),
+        "year": year or "",
+        "type": work_type,
+        "title": work_title(work),
+        "journal": source_name(work),
+        "all_authors": author_names(work),
+        "openalex_author_id": short_openalex_id(selected_author_id),
+        "orcid": selected_orcid,
+        "identity_decision": decision,
+        "identity_score": round(score, 3),
+        "identity_flags": "|".join(flags),
+    }
+
+
 def work_row(work: dict[str, Any]) -> dict[str, Any]:
     ids = work.get("ids") or {}
     openalex_id = short_openalex_id(work.get("id", ""))
@@ -396,6 +855,13 @@ def write_author_candidates(rows: list[dict[str, Any]]) -> None:
         writer.writerows(rows)
 
 
+def write_dict_rows(path: str, rows: list[dict[str, Any]], fieldnames: list[str]) -> None:
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
 def load_author_overrides() -> dict[str, dict[str, Any]]:
     """Load optional manual author resolutions keyed by researcher name."""
     if not os.path.exists(OVERRIDES_CSV):
@@ -411,14 +877,15 @@ def load_author_overrides() -> dict[str, dict[str, Any]]:
             override = {
                 "author_id": author_id,
                 "profile_publications_url": str(row.get("profile_publications_url", "") or "").strip(),
-                "doi_allowlist": {
+                "explicit_doi_allowlist": {
                     normalize_doi(doi)
                     for doi in re.split(r"[|;,\s]+", str(row.get("doi_allowlist", "") or ""))
                     if normalize_doi(doi)
                 },
+                "profile_dois": set(),
             }
             if override["profile_publications_url"] and override["profile_publications_url"].lower() != "nan":
-                override["doi_allowlist"].update(profile_dois(override["profile_publications_url"]))
+                override["profile_dois"].update(profile_dois(override["profile_publications_url"]))
             overrides[normalize_name(name)] = override
             overrides[normalize_name(clean_researcher_name(name))] = override
     return overrides
@@ -441,7 +908,18 @@ def assert_can_write(paths: list[str], overwrite: bool) -> None:
 
 
 def scrape(overwrite: bool = False) -> None:
-    assert_can_write([OUTPUT_CSV, AUTHORS_CSV, CITATIONS_CSV, CANDIDATES_CSV], overwrite)
+    assert_can_write(
+        [
+            OUTPUT_CSV,
+            AUTHORS_CSV,
+            CITATIONS_CSV,
+            CANDIDATES_CSV,
+            CANDIDATE_WORKS_CSV,
+            WORK_EVIDENCE_CSV,
+            REJECTED_WORKS_CSV,
+        ],
+        overwrite,
+    )
 
     print("Parsing researchers from xlsx...")
     researchers = clean_researchers(parse_researchers(XLSX_FILE))
@@ -452,24 +930,35 @@ def scrape(overwrite: bool = False) -> None:
     overrides = load_author_overrides()
     if overrides:
         print(f"  Loaded {len(overrides)} manual author overrides from {OVERRIDES_CSV}")
+    orcid_cache = load_orcid_cache()
 
     papers: dict[str, dict[str, Any]] = {}
     author_rows: list[dict[str, Any]] = []
     candidate_rows: list[dict[str, Any]] = []
+    candidate_work_rows: list[dict[str, Any]] = []
+    evidence_rows: list[dict[str, Any]] = []
+    rejected_rows: list[dict[str, Any]] = []
     unresolved: list[str] = []
 
     for researcher in tqdm(researchers, desc="Authors"):
         override = overrides.get(normalize_name(researcher["name"]))
-        doi_allowlist: set[str] = set()
+        explicit_dois: set[str] = set()
+        profile_dois_set: set[str] = set()
         if override:
-            doi_allowlist = set(override.get("doi_allowlist", set()))
-            selected = {
+            explicit_dois = set(override.get("explicit_doi_allowlist", set()))
+            profile_dois_set = set(override.get("profile_dois", set()))
+            selected = fetch_openalex_author(override["author_id"]) or {
                 "id": override["author_id"],
                 "display_name": researcher["name"],
+                "orcid": "",
                 "_rank": "override",
                 "_score": "override",
                 "_has_glasgow": "",
             }
+            selected = dict(selected)
+            selected["_rank"] = "override"
+            selected["_score"] = "override"
+            selected["_has_glasgow"] = has_glasgow_affiliation(selected, glasgow_id)
             candidates = [selected]
         else:
             selected, candidates = resolve_author(researcher, glasgow_id)
@@ -499,23 +988,46 @@ def scrape(overwrite: bool = False) -> None:
             unresolved.append(researcher["name"])
             continue
 
+        selected_orcid = normalize_orcid(selected.get("orcid"))
+        orcid_info = orcid_profile(selected_orcid, orcid_cache) if selected_orcid else {}
         works = iter_author_works(selected["id"])
-        if doi_allowlist:
-            doi_works = [fetch_work_by_doi(doi) for doi in sorted(doi_allowlist)]
-            works = merge_unique_works(works + [work for work in doi_works if work])
-            before_filter = len(works)
-            works = [
-                work for work in works
-                if normalize_doi((work.get("doi") or (work.get("ids") or {}).get("doi"))) in doi_allowlist
-            ]
-            print(
-                f"  DOI allowlist for {researcher['name']}: "
-                f"retained {len(works)}/{before_filter} OpenAlex works"
-            )
+        trusted_dois = explicit_dois | profile_dois_set | set(orcid_info.get("work_dois") or set())
+        rescue_dois = explicit_dois | profile_dois_set
+        doi_works = [fetch_work_by_doi(doi) for doi in sorted(rescue_dois)]
+        works = merge_unique_works(works + [work for work in doi_works if work])
+
+        trusted_coauthors = build_trusted_coauthors(
+            works,
+            researcher["name"],
+            trusted_dois,
+            set(orcid_info.get("work_titles") or set()),
+        )
+        kept = quarantined = excluded = 0
         for work in works:
             row = work_row(work)
             if not row["paper_id"] or not row["title"]:
                 continue
+            evidence = score_work_identity(
+                work=work,
+                researcher=researcher,
+                selected_author_id=selected_id,
+                selected_orcid=selected_orcid,
+                glasgow_id=glasgow_id,
+                explicit_dois=explicit_dois,
+                profile_dois_set=profile_dois_set,
+                orcid_info=orcid_info,
+                trusted_coauthors=trusted_coauthors,
+            )
+            candidate_work_rows.append(evidence)
+            evidence_rows.append(evidence)
+            if evidence["identity_decision"] != "include":
+                rejected_rows.append(evidence)
+                if evidence["identity_decision"] == "quarantine":
+                    quarantined += 1
+                else:
+                    excluded += 1
+                continue
+            kept += 1
             papers[row["paper_id"]] = row
             author_rows.append(
                 {
@@ -528,8 +1040,37 @@ def scrape(overwrite: bool = False) -> None:
                     "openalex_author_id": selected_id,
                 }
             )
+        if quarantined or excluded:
+            tqdm.write(
+                f"  Identity filter for {researcher['name']}: "
+                f"included {kept}, quarantined {quarantined}, excluded {excluded}"
+            )
 
     write_author_candidates(candidate_rows)
+    save_orcid_cache(orcid_cache)
+
+    evidence_fieldnames = [
+        "researcher_name",
+        "school",
+        "college",
+        "paper_id",
+        "openalex_id",
+        "pmid",
+        "doi",
+        "year",
+        "type",
+        "title",
+        "journal",
+        "all_authors",
+        "openalex_author_id",
+        "orcid",
+        "identity_decision",
+        "identity_score",
+        "identity_flags",
+    ]
+    write_dict_rows(CANDIDATE_WORKS_CSV, candidate_work_rows, evidence_fieldnames)
+    write_dict_rows(WORK_EVIDENCE_CSV, evidence_rows, evidence_fieldnames)
+    write_dict_rows(REJECTED_WORKS_CSV, rejected_rows, evidence_fieldnames)
 
     paper_df = pd.DataFrame(papers.values()).sort_values(["year", "paper_id"], ascending=[False, True])
     paper_df.to_csv(OUTPUT_CSV, index=False)
@@ -543,6 +1084,9 @@ def scrape(overwrite: bool = False) -> None:
     print(f"\nDone. Wrote {len(paper_df)} unique works to {OUTPUT_CSV}")
     print(f"Author-paper mappings: {len(authors_df)} rows to {AUTHORS_CSV}")
     print(f"Author-resolution audit: {len(candidate_rows)} rows to {CANDIDATES_CSV}")
+    print(f"Candidate work audit: {len(candidate_work_rows)} rows to {CANDIDATE_WORKS_CSV}")
+    print(f"Identity evidence audit: {len(evidence_rows)} rows to {WORK_EVIDENCE_CSV}")
+    print(f"Rejected/quarantined work audit: {len(rejected_rows)} rows to {REJECTED_WORKS_CSV}")
     if unresolved:
         print(f"Unresolved researchers ({len(unresolved)}): {', '.join(unresolved)}")
 
