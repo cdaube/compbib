@@ -517,6 +517,18 @@ select.btn{{padding-right:24px}}
 .slider-row{{display:flex;align-items:center;gap:10px;padding:10px 12px;border:1px solid #dbe4ee;background:#ffffff;border-radius:10px}}
 .slider-row input[type="range"]{{flex:1;accent-color:#0f172a}}
 .slider-value{{min-width:28px;text-align:right;font-size:12px;color:#475569}}
+.author-search{{display:flex;flex-direction:column;gap:8px;padding:10px 12px;border:1px solid #dbe4ee;background:#ffffff;border-radius:10px}}
+.author-search-row{{display:flex;gap:6px;align-items:center}}
+.author-search-input{{min-width:0;flex:1;border:1px solid #cbd5e1;border-radius:6px;padding:6px 8px;font-size:12px;color:#0f172a;background:#ffffff}}
+.author-search-input:focus{{outline:2px solid rgba(15,23,42,0.16);outline-offset:1px}}
+.author-results{{display:flex;flex-direction:column;gap:5px;max-height:180px;overflow-y:auto}}
+.author-result{{display:grid;grid-template-columns:8px minmax(0,1fr) auto;align-items:center;gap:8px;border:1px solid #e2e8f0;background:#f8fafc;border-radius:7px;padding:6px 7px;cursor:pointer;text-align:left;color:#1e293b}}
+.author-result:hover{{background:#f1f5f9;border-color:#cbd5e1}}
+.author-result.active{{border-color:#0f172a;background:#eef2f7}}
+.author-result-swatch{{width:8px;height:28px;border-radius:999px}}
+.author-result-name{{font-size:12px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
+.author-result-meta{{font-size:11px;color:#64748b;white-space:nowrap}}
+.author-empty{{font-size:12px;color:#94a3b8;padding:2px 1px}}
 .toggle-row{{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 12px;border:1px solid #dbe4ee;background:#ffffff;border-radius:10px}}
 .toggle-copy{{display:flex;flex-direction:column;gap:2px}}
 .toggle-title{{font-size:13px;color:#1e293b}}
@@ -648,6 +660,16 @@ a:hover{{text-decoration:underline}}
             <span id="point-size-value" class="slider-value">4</span>
           </label>
         </div>
+        <div class="control-block">
+          <label class="control-label" for="author-search-input">Author</label>
+          <div class="author-search">
+            <div class="author-search-row">
+              <input id="author-search-input" class="author-search-input" type="search" placeholder="Search author" autocomplete="off" />
+              <button id="author-search-reset" class="btn" type="button">Reset</button>
+            </div>
+            <div id="author-search-results" class="author-results"></div>
+          </div>
+        </div>
       </div>
       <div class="instructions">Hover for preview &middot; Click to pin details &middot; Use the menu to change colour or projection</div>
       <div id="paper-detail" style="color:#94a3b8;">Click a point to see its details.</div>
@@ -746,8 +768,50 @@ let citationNetworkEnabled = false;
 let imagingOnlyEnabled = false;
 let pointSize = 4;
 let interactionMode = 'pan';
+let activeAuthorName = '';
 
 const imagingMask = DATA.map(d => IMAGING_REGEX.test(d.abstract || ''));
+
+function splitAuthors(value) {{
+  return String(value || '')
+    .split(';')
+    .map(name => name.trim())
+    .filter(Boolean);
+}}
+
+function normalizeSearch(value) {{
+  return String(value || '')
+    .normalize('NFKD')
+    .replace(/[\\u0300-\\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}}
+
+const datumGlasgowAuthors = DATA.map(d => splitAuthors(d.glasgow_authors));
+const authorSummaries = new Map();
+DATA.forEach((d, idx) => {{
+  datumGlasgowAuthors[idx].forEach(author => {{
+    if (!authorSummaries.has(author)) {{
+      authorSummaries.set(author, {{
+        name: author,
+        norm: normalizeSearch(author),
+        count: 0,
+        schools: new Map(),
+      }});
+    }}
+    const summary = authorSummaries.get(author);
+    summary.count += 1;
+    summary.schools.set(d.school, (summary.schools.get(d.school) || 0) + 1);
+  }});
+}});
+
+const authorList = Array.from(authorSummaries.values()).map(summary => {{
+  const schools = Array.from(summary.schools.entries()).sort((a, b) => b[1] - a[1]);
+  const primarySchool = schools[0]?.[0] || '';
+  return {{ ...summary, primarySchool, schoolCount: schools.length }};
+}}).sort((a, b) => a.name.localeCompare(b.name));
+const authorByName = new Map(authorList.map(summary => [summary.name, summary]));
 
 // pre-index
 const paperIdx = {{}};
@@ -1022,7 +1086,11 @@ function getColors(mode) {{
 
 function getMarkerSizes() {{
   const mode = getCurrentMode();
-  return DATA.map(d => isDatumVisible(d, mode) ? pointSize : 0.01);
+  return DATA.map((d, idx) => {{
+    if (!isDatumVisible(d, mode, idx)) return 0.01;
+    const isAuthorHit = activeAuthorName && datumGlasgowAuthors[idx].includes(activeAuthorName);
+    return isAuthorHit ? pointSize + 3 : pointSize;
+  }});
 }}
 
 function getLegendItems(mode) {{
@@ -1299,11 +1367,98 @@ const pointSizeSlider = document.getElementById('point-size-slider');
 const pointSizeValue = document.getElementById('point-size-value');
 const interactionModeSelect = document.getElementById('interaction-mode');
 const imagingOnlyToggle = document.getElementById('imaging-only-toggle');
+const authorSearchInput = document.getElementById('author-search-input');
+const authorSearchResults = document.getElementById('author-search-results');
+const authorSearchReset = document.getElementById('author-search-reset');
 citationNetworkToggle.checked = citationNetworkEnabled;
 imagingOnlyToggle.checked = imagingOnlyEnabled;
 pointSizeSlider.value = String(pointSize);
 pointSizeValue.textContent = String(pointSize);
 interactionModeSelect.value = interactionMode;
+
+function authorResultScore(query, summary) {{
+  if (!query) return 0;
+  const name = summary.norm;
+  const words = name.split(' ');
+  if (name === query) return 1000 + summary.count;
+  if (name.startsWith(query)) return 850 + summary.count;
+  if (words.some(word => word.startsWith(query))) return 700 + summary.count;
+  if (name.includes(query)) return 550 + summary.count;
+  const parts = query.split(' ').filter(Boolean);
+  if (parts.length > 1 && parts.every(part => name.includes(part))) return 450 + summary.count;
+  let pos = 0;
+  for (const ch of query.replace(/\\s+/g, '')) {{
+    pos = name.indexOf(ch, pos);
+    if (pos === -1) return 0;
+    pos += 1;
+  }}
+  return query.length >= 3 ? 250 + summary.count : 0;
+}}
+
+function renderAuthorResults() {{
+  const query = normalizeSearch(authorSearchInput.value);
+  authorSearchResults.innerHTML = '';
+  if (!query) {{
+    if (activeAuthorName) {{
+      const active = authorByName.get(activeAuthorName);
+      if (active) renderAuthorResultButton(active);
+    }} else {{
+      const empty = document.createElement('div');
+      empty.className = 'author-empty';
+      empty.textContent = 'No author selected.';
+      authorSearchResults.appendChild(empty);
+    }}
+    return;
+  }}
+
+  const matches = authorList
+    .map(summary => [summary, authorResultScore(query, summary)])
+    .filter(([, score]) => score > 0)
+    .sort((a, b) => b[1] - a[1] || a[0].name.localeCompare(b[0].name))
+    .slice(0, 8);
+
+  if (!matches.length) {{
+    const empty = document.createElement('div');
+    empty.className = 'author-empty';
+    empty.textContent = 'No matches.';
+    authorSearchResults.appendChild(empty);
+    return;
+  }}
+
+  matches.forEach(([summary]) => renderAuthorResultButton(summary));
+}}
+
+function renderAuthorResultButton(summary) {{
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'author-result';
+  if (summary.name === activeAuthorName) button.classList.add('active');
+  button.dataset.authorName = summary.name;
+  button.title = summary.name;
+
+  const swatch = document.createElement('span');
+  swatch.className = 'author-result-swatch';
+  swatch.style.background = SCHOOL_COLORS[summary.primarySchool] || '#64748b';
+  button.appendChild(swatch);
+
+  const name = document.createElement('span');
+  name.className = 'author-result-name';
+  name.textContent = summary.name;
+  button.appendChild(name);
+
+  const meta = document.createElement('span');
+  meta.className = 'author-result-meta';
+  meta.textContent = `${{summary.count}}`;
+  button.appendChild(meta);
+
+  authorSearchResults.appendChild(button);
+}}
+
+function setActiveAuthor(authorName) {{
+  activeAuthorName = authorName || '';
+  Plotly.restyle('umap-plot', {{ 'marker.size': [getMarkerSizes()] }}, [0]);
+  renderAuthorResults();
+}}
 
 function applyColourState() {{
   const mode = modeSelect.value;
@@ -1313,6 +1468,7 @@ function applyColourState() {{
   }}
   Plotly.restyle('umap-plot', {{ 'marker.color': [getColors(mode)], 'marker.size': [getMarkerSizes()] }}, [0]);
   renderLegend(mode);
+  renderAuthorResults();
   if (citationNetworkEnabled) {{
     drawCitationNetwork(selectedPointIndex !== null ? DATA[selectedPointIndex].paper_id : null);
   }} else {{
@@ -1501,6 +1657,18 @@ interactionModeSelect.addEventListener('change', () => {{
   persistInteractionMode();
   Plotly.relayout('umap-plot', {{ dragmode: interactionMode }});
 }});
+
+authorSearchInput.addEventListener('input', renderAuthorResults);
+authorSearchResults.addEventListener('click', ev => {{
+  const button = eventElementTarget(ev)?.closest('.author-result');
+  if (!button) return;
+  setActiveAuthor(button.dataset.authorName);
+}});
+authorSearchReset.addEventListener('click', () => {{
+  authorSearchInput.value = '';
+  setActiveAuthor('');
+}});
+renderAuthorResults();
 
 // ── panel toggling ───────────────────────────────────────────────
 const panelToggle = document.getElementById('panel-toggle');
