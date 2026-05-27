@@ -546,6 +546,11 @@ a:hover{{text-decoration:underline}}
 #colour-legend .leg-title{{font-weight:600;margin-bottom:6px;font-size:12px;color:#1e293b}}
 .leg-group-title{{font-weight:700;margin:9px 0 5px;font-size:11px;letter-spacing:0.04em;text-transform:uppercase;color:#0f172a}}
 .leg-group-title:first-of-type{{margin-top:0}}
+.leg-bulk{{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin:0 0 8px}}
+.leg-bulk-row{{display:flex;align-items:center;gap:5px;border:1px solid #e2e8f0;background:#f8fafc;border-radius:6px;padding:4px 6px;color:#334155;cursor:pointer;min-width:0}}
+.leg-bulk-row:hover{{background:#f1f5f9}}
+.leg-bulk-row input{{margin:0;accent-color:#0f172a;flex-shrink:0}}
+.leg-bulk-label{{font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
 .leg-item{{display:flex;align-items:center;gap:6px;margin-bottom:3px;opacity:0.9}}
 .leg-item:hover{{opacity:1}}
 .leg-swatch-btn{{width:14px;height:14px;border-radius:3px;flex-shrink:0;border:1px solid rgba(15,23,42,0.18);padding:0;display:inline-flex;align-items:center;justify-content:center;cursor:pointer;color:#ffffff;font-size:10px;line-height:1;background-clip:padding-box}}
@@ -687,6 +692,8 @@ const N = DATA.length;
 const presentSchools = new Set(DATA.map(d => d.school).filter(Boolean));
 const presentColleges = new Set(DATA.map(d => d.college).filter(Boolean));
 const presentYears = Array.from(new Set(DATA.map(d => d.year_int).filter(y => y !== null))).sort((a, b) => a - b);
+const MVLS_SCHOOL_SET = new Set(SCHOOL_ORDER.slice(0, SCHOOL_ORDER.indexOf('School of Mathematics and Statistics')));
+const OTHER_SCHOOL_SET = new Set(SCHOOL_ORDER.filter(school => !MVLS_SCHOOL_SET.has(school)));
 const SCHOOL_COLOR_STORAGE_KEY = 'glasgow-explorer-school-colors-v2';
 const SCHOOL_VISIBILITY_STORAGE_KEY = 'glasgow-explorer-school-visibility-v1';
 const COLLEGE_VISIBILITY_STORAGE_KEY = 'glasgow-explorer-college-visibility-v1';
@@ -954,6 +961,29 @@ function isSchoolVisible(school) {{
   return !hiddenSchools.has(school);
 }}
 
+function schoolGroupMembers(group) {{
+  const groupSet = group === 'mvls' ? MVLS_SCHOOL_SET : OTHER_SCHOOL_SET;
+  return SCHOOL_ORDER.filter(school => presentSchools.has(school) && groupSet.has(school));
+}}
+
+function schoolGroupVisibility(group) {{
+  const members = schoolGroupMembers(group);
+  const visible = members.filter(isSchoolVisible).length;
+  return {{ members, visible }};
+}}
+
+function setSchoolGroupVisible(group, visible) {{
+  schoolGroupMembers(group).forEach(school => {{
+    if (visible) {{
+      hiddenSchools.delete(school);
+    }} else {{
+      hiddenSchools.add(school);
+    }}
+  }});
+  persistHiddenSchools();
+  applyColourState();
+}}
+
 function isCollegeVisible(college) {{
   return !hiddenColleges.has(college);
 }}
@@ -1162,6 +1192,31 @@ function renderLegend(mode) {{
   legendEl.appendChild(title);
 
   if (mode === 'school') {{
+    const bulk = document.createElement('div');
+    bulk.className = 'leg-bulk';
+    [
+      ['mvls', 'MVLS'],
+      ['other', 'Other'],
+    ].forEach(([group, label]) => {{
+      const state = schoolGroupVisibility(group);
+      const bulkLabel = document.createElement('label');
+      bulkLabel.className = 'leg-bulk-row';
+      bulkLabel.title = `Toggle all ${{label}} schools`;
+      const checkbox = document.createElement('input');
+      checkbox.type = 'checkbox';
+      checkbox.dataset.schoolGroupToggle = group;
+      checkbox.checked = state.members.length > 0 && state.visible === state.members.length;
+      checkbox.indeterminate = state.visible > 0 && state.visible < state.members.length;
+      checkbox.disabled = state.members.length === 0;
+      const text = document.createElement('span');
+      text.className = 'leg-bulk-label';
+      text.textContent = label;
+      bulkLabel.appendChild(checkbox);
+      bulkLabel.appendChild(text);
+      bulk.appendChild(bulkLabel);
+    }});
+    legendEl.appendChild(bulk);
+
     const mvlsHeader = document.createElement('div');
     mvlsHeader.className = 'leg-group-title';
     mvlsHeader.textContent = 'MVLS';
@@ -1311,6 +1366,13 @@ function closePalette() {{
 function eventElementTarget(ev) {{
   return ev.target instanceof Element ? ev.target : ev.target?.parentElement || null;
 }}
+
+legendEl.addEventListener('change', ev => {{
+  const groupToggle = eventElementTarget(ev)?.closest('[data-school-group-toggle]');
+  if (groupToggle) {{
+    setSchoolGroupVisible(groupToggle.dataset.schoolGroupToggle, groupToggle.checked);
+  }}
+}});
 
 legendEl.addEventListener('click', ev => {{
   const toggle = eventElementTarget(ev)?.closest('[data-school-toggle]');
