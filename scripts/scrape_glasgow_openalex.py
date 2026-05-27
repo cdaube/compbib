@@ -65,8 +65,8 @@ ORCID_BASE = "https://pub.orcid.org/v3.0"
 POLITE_EMAIL = "christoph.daube@gmail.com"
 GLASGOW_ROR = "https://ror.org/00vtgdb53"
 
-REQUEST_SLEEP = 0.1
-MAX_RETRIES = 5
+REQUEST_SLEEP = 0.25
+MAX_RETRIES = 8
 WORKS_PER_PAGE = 200
 AUTHOR_CANDIDATES = 10
 
@@ -197,6 +197,19 @@ def fetch_json(path: str, params: dict[str, Any] | None = None) -> dict[str, Any
             resp = requests.get(url, params=params, timeout=45)
             resp.raise_for_status()
             return resp.json()
+        except requests.HTTPError as exc:
+            if attempt == MAX_RETRIES - 1:
+                raise
+            status = exc.response.status_code if exc.response is not None else None
+            if status == 429:
+                retry_after = exc.response.headers.get("Retry-After") if exc.response is not None else None
+                try:
+                    wait = float(retry_after) if retry_after else 0
+                except ValueError:
+                    wait = 0
+                time.sleep(max(wait, 30 * (attempt + 1)))
+            else:
+                time.sleep(2 ** (attempt + 1))
         except Exception:
             if attempt == MAX_RETRIES - 1:
                 raise
@@ -429,6 +442,57 @@ def author_score(researcher: dict[str, str], candidate: dict[str, Any], glasgow_
     return score
 
 
+def author_count(candidate: dict[str, Any], key: str) -> int:
+    try:
+        return int(candidate.get(key) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def prefer_orcid_backed_duplicate(
+    researcher: dict[str, str],
+    selected: dict[str, Any] | None,
+    ranked: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Prefer a rich ORCID-backed author over tiny exact-name OpenAlex fragments."""
+    if not selected:
+        return selected
+
+    selected_works = author_count(selected, "works_count")
+    selected_citations = author_count(selected, "cited_by_count")
+    if selected.get("orcid") and selected_works >= 25:
+        return selected
+    if selected_works > 25:
+        return selected
+
+    rich_duplicates = []
+    for candidate in ranked:
+        if candidate is selected:
+            continue
+        if not candidate.get("_has_glasgow") or not candidate.get("orcid"):
+            continue
+        if not first_last_match(researcher["name"], candidate.get("display_name", "")):
+            continue
+        works = author_count(candidate, "works_count")
+        citations = author_count(candidate, "cited_by_count")
+        if works < max(50, selected_works * 5):
+            continue
+        if citations < max(500, selected_citations * 5):
+            continue
+        rich_duplicates.append(candidate)
+
+    if not rich_duplicates:
+        return selected
+    return max(
+        rich_duplicates,
+        key=lambda candidate: (
+            author_count(candidate, "works_count"),
+            author_count(candidate, "cited_by_count"),
+            candidate.get("_score", 0),
+        ),
+    )
+
+
 def search_author_candidates(name: str) -> list[dict[str, Any]]:
     params = {
         "search": name,
@@ -478,6 +542,7 @@ def resolve_author(researcher: dict[str, str], glasgow_id: str) -> tuple[dict[st
     elif best_glasgow and initial_last_match(researcher["name"], best_glasgow.get("display_name", "")) and best_glasgow["_score"] >= 95:
         selected = best_glasgow
 
+    selected = prefer_orcid_backed_duplicate(researcher, selected, ranked)
     return selected, ranked
 
 

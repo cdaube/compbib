@@ -788,30 +788,57 @@ function normalizeSearch(value) {{
     .trim();
 }}
 
+function authorIdentityKey(value) {{
+  const parts = normalizeSearch(value).split(' ').filter(Boolean);
+  if (parts.length >= 2) return `${{parts[0].slice(0, 1)}} ${{parts[parts.length - 1]}}`;
+  return parts.join(' ');
+}}
+
+function preferredAuthorDisplayName(names) {{
+  return Array.from(names.entries()).sort((a, b) => {{
+    const countDiff = b[1] - a[1];
+    if (countDiff) return countDiff;
+    const initialsA = (a[0].match(/\\b[A-Z]\\./g) || []).length;
+    const initialsB = (b[0].match(/\\b[A-Z]\\./g) || []).length;
+    if (initialsA !== initialsB) return initialsB - initialsA;
+    return b[0].length - a[0].length;
+  }})[0]?.[0] || '';
+}}
+
 const datumGlasgowAuthors = DATA.map(d => splitAuthors(d.glasgow_authors));
+const datumAllAuthors = DATA.map(d => splitAuthors(d.all_authors));
+const datumSearchAuthorKeys = [];
 const authorSummaries = new Map();
 DATA.forEach((d, idx) => {{
-  datumGlasgowAuthors[idx].forEach(author => {{
-    if (!authorSummaries.has(author)) {{
-      authorSummaries.set(author, {{
-        name: author,
-        norm: normalizeSearch(author),
+  const paperAuthorKeys = new Set();
+  [...datumAllAuthors[idx], ...datumGlasgowAuthors[idx]].forEach(author => {{
+    const key = authorIdentityKey(author);
+    if (!key) return;
+    if (!authorSummaries.has(key)) {{
+      authorSummaries.set(key, {{
+        key,
+        names: new Map(),
         count: 0,
         schools: new Map(),
       }});
     }}
-    const summary = authorSummaries.get(author);
+    const summary = authorSummaries.get(key);
+    summary.names.set(author, (summary.names.get(author) || 0) + 1);
+    if (paperAuthorKeys.has(key)) return;
+    paperAuthorKeys.add(key);
     summary.count += 1;
     summary.schools.set(d.school, (summary.schools.get(d.school) || 0) + 1);
   }});
+  datumSearchAuthorKeys[idx] = Array.from(paperAuthorKeys);
 }});
 
 const authorList = Array.from(authorSummaries.values()).map(summary => {{
   const schools = Array.from(summary.schools.entries()).sort((a, b) => b[1] - a[1]);
   const primarySchool = schools[0]?.[0] || '';
-  return {{ ...summary, primarySchool, schoolCount: schools.length }};
+  const name = preferredAuthorDisplayName(summary.names);
+  return {{ ...summary, name, norm: normalizeSearch(name), primarySchool, schoolCount: schools.length }};
 }}).sort((a, b) => a.name.localeCompare(b.name));
-const authorByName = new Map(authorList.map(summary => [summary.name, summary]));
+const authorByKey = new Map(authorList.map(summary => [summary.key, summary]));
 
 // pre-index
 const paperIdx = {{}};
@@ -1106,7 +1133,7 @@ function datumColor(d, mode, idx) {{
   if (mode === 'college') color = COLLEGE_COLORS[d.college] || 'rgb(80,80,80)';
   if (mode === 'year') color = yearColor(d.year_int);
   if (mode === 'citations') color = SCHOOL_COLORS[d.school] || 'rgb(180,180,180)';
-  const isAuthorContext = activeAuthorName && !datumGlasgowAuthors[idx].includes(activeAuthorName);
+  const isAuthorContext = activeAuthorName && !datumSearchAuthorKeys[idx].includes(activeAuthorName);
   return isAuthorContext ? paleAuthorContextColor(color) : color;
 }}
 
@@ -1118,7 +1145,7 @@ function getMarkerSizes() {{
   const mode = getCurrentMode();
   return DATA.map((d, idx) => {{
     if (!isDatumVisible(d, mode, idx)) return 0.01;
-    const isAuthorHit = activeAuthorName && datumGlasgowAuthors[idx].includes(activeAuthorName);
+    const isAuthorHit = activeAuthorName && datumSearchAuthorKeys[idx].includes(activeAuthorName);
     return isAuthorHit ? pointSize + 3 : pointSize;
   }});
 }}
@@ -1430,7 +1457,7 @@ function renderAuthorResults() {{
   authorSearchResults.innerHTML = '';
   if (!query) {{
     if (activeAuthorName) {{
-      const active = authorByName.get(activeAuthorName);
+      const active = authorByKey.get(activeAuthorName);
       if (active) renderAuthorResultButton(active);
     }} else {{
       const empty = document.createElement('div');
@@ -1462,8 +1489,8 @@ function renderAuthorResultButton(summary) {{
   const button = document.createElement('button');
   button.type = 'button';
   button.className = 'author-result';
-  if (summary.name === activeAuthorName) button.classList.add('active');
-  button.dataset.authorName = summary.name;
+  if (summary.key === activeAuthorName) button.classList.add('active');
+  button.dataset.authorKey = summary.key;
   button.title = summary.name;
 
   const swatch = document.createElement('span');
@@ -1692,7 +1719,7 @@ authorSearchInput.addEventListener('input', renderAuthorResults);
 authorSearchResults.addEventListener('click', ev => {{
   const button = eventElementTarget(ev)?.closest('.author-result');
   if (!button) return;
-  setActiveAuthor(button.dataset.authorName);
+  setActiveAuthor(button.dataset.authorKey);
 }});
 authorSearchReset.addEventListener('click', () => {{
   authorSearchInput.value = '';
