@@ -663,23 +663,11 @@ a:hover{{text-decoration:underline}}
           </select>
         </div>
         <div class="control-block">
-          <div class="control-label">Dimension</div>
-          <label class="toggle-row" for="umap-3d-toggle">
-            <span class="toggle-copy">
-              <span class="toggle-title">3D UMAP</span>
-              <span class="toggle-sub">Switch to a rotatable three-dimensional projection.</span>
-            </span>
-            <span class="switch">
-              <input id="umap-3d-toggle" type="checkbox" />
-              <span class="switch-track"><span class="switch-thumb"></span></span>
-            </span>
-          </label>
-        </div>
-        <div class="control-block">
           <label class="control-label" for="interaction-mode">Interaction</label>
           <select id="interaction-mode" class="btn">
             <option value="pan">Move map</option>
             <option value="zoom">Zoom box</option>
+            <option value="rotate">Rotate in 3D</option>
           </select>
         </div>
         <div class="control-block">
@@ -780,7 +768,6 @@ const CITATION_NETWORK_STORAGE_KEY = 'glasgow-explorer-citation-network-v1';
 const IMAGING_ONLY_STORAGE_KEY = 'glasgow-explorer-imaging-only-v1';
 const POINT_SIZE_STORAGE_KEY = 'glasgow-explorer-point-size-v1';
 const INTERACTION_MODE_STORAGE_KEY = 'glasgow-explorer-interaction-mode-v1';
-const VIEW_DIMENSION_STORAGE_KEY = 'glasgow-explorer-view-dimension-v1';
 const CITATION_LINE_STYLES = {{
   network: {{ color: 'rgb(71,85,105)', opacity: 0.14 }},
   outgoing: {{ color: 'rgb(59,130,246)', opacity: 0.72 }},
@@ -831,7 +818,6 @@ let imagingOnlyEnabled = false;
 let pointSize = 4;
 let interactionMode = 'pan';
 let activeAuthorName = '';
-let is3DMode = false;
 
 const imagingMask = DATA.map(d => IMAGING_REGEX.test(d.abstract || ''));
 
@@ -1119,24 +1105,11 @@ function loadInteractionMode() {{
 
 function persistInteractionMode() {{
   try {{
-    localStorage.setItem(INTERACTION_MODE_STORAGE_KEY, interactionMode);
-  }} catch (_err) {{
-    // Ignore browsers that block storage.
-  }}
-}}
-
-function loadViewDimension() {{
-  is3DMode = false;
-  try {{
-    localStorage.removeItem(VIEW_DIMENSION_STORAGE_KEY);
-  }} catch (_err) {{
-    is3DMode = false;
-  }}
-}}
-
-function persistViewDimension() {{
-  try {{
-    localStorage.removeItem(VIEW_DIMENSION_STORAGE_KEY);
+    if (interactionMode === 'rotate') {{
+      localStorage.removeItem(INTERACTION_MODE_STORAGE_KEY);
+    }} else {{
+      localStorage.setItem(INTERACTION_MODE_STORAGE_KEY, interactionMode);
+    }}
   }} catch (_err) {{
     // Ignore browsers that block storage.
   }}
@@ -1150,7 +1123,6 @@ loadCitationNetworkEnabled();
 loadImagingOnlyEnabled();
 loadPointSize();
 loadInteractionMode();
-loadViewDimension();
 
 function isSchoolVisible(school) {{
   return !hiddenSchools.has(school);
@@ -1260,6 +1232,10 @@ function activeZs() {{
   return UMAP_3D.zs[currentProjection];
 }}
 
+function isRotateMode() {{
+  return interactionMode === 'rotate';
+}}
+
 function syncDataCoordinates() {{
   const xs = activeXs();
   const ys = activeYs();
@@ -1272,17 +1248,18 @@ function syncDataCoordinates() {{
 }}
 
 function buildScatterTrace() {{
-  return {{
+  const trace = {{
     x: activeXs(),
     y: activeYs(),
-    z: activeZs(),
     mode: 'markers',
-    type: 'scatter3d',
+    type: isRotateMode() ? 'scatter3d' : 'scattergl',
     marker: {{ size: getMarkerSizes(), opacity: 0.5, color: getColors(getCurrentMode()) }},
     text: texts,
     hovertemplate: '<b>%{{text}}</b><extra></extra>',
     hoverinfo: 'text',
   }};
+  if (isRotateMode()) trace.z = activeZs();
+  return trace;
 }}
 
 function getSceneCamera() {{
@@ -1295,20 +1272,31 @@ function getSceneCamera() {{
 }}
 
 function getPlotLayout() {{
-  return {{
+  const base = {{
     paper_bgcolor: '#ffffff',
     plot_bgcolor: '#ffffff',
     margin: {{ l: 5, r: 5, t: 5, b: 5 }},
     showlegend: false,
     hovermode: 'closest',
-    scene: {{
-      xaxis: {{ visible: false }},
-      yaxis: {{ visible: false }},
-      zaxis: {{ visible: false }},
-      aspectmode: 'data',
-      dragmode: is3DMode ? 'orbit' : interactionMode,
-      camera: getSceneCamera(),
-    }},
+  }};
+  if (isRotateMode()) {{
+    return {{
+      ...base,
+      scene: {{
+        xaxis: {{ visible: false }},
+        yaxis: {{ visible: false }},
+        zaxis: {{ visible: false }},
+        aspectmode: 'data',
+        dragmode: 'orbit',
+        camera: getSceneCamera(),
+      }},
+    }};
+  }}
+  return {{
+    ...base,
+    xaxis: {{ visible: false }},
+    yaxis: {{ visible: false }},
+    dragmode: interactionMode,
   }};
 }}
 
@@ -1359,17 +1347,18 @@ function isEdgeVisible(sourcePaperId, targetPaperId) {{
 }}
 
 function edgeLineTrace(ex, ey, ez, style, width) {{
-  return {{
+  const trace = {{
     x: ex,
     y: ey,
-    z: ez,
     mode: 'lines',
-    type: 'scatter3d',
+    type: isRotateMode() ? 'scatter3d' : 'scatter',
     line: {{ color: style.color, width }},
     opacity: style.opacity,
     hoverinfo: 'skip',
     showlegend: false,
   }};
+  if (isRotateMode()) trace.z = ez;
+  return trace;
 }}
 
 function buildSelectedEdgeTraces(paperId) {{
@@ -1570,7 +1559,6 @@ const projectionSelect = document.getElementById('projection-select');
 const pointSizeSlider = document.getElementById('point-size-slider');
 const pointSizeValue = document.getElementById('point-size-value');
 const interactionModeSelect = document.getElementById('interaction-mode');
-const umap3DToggle = document.getElementById('umap-3d-toggle');
 const imagingOnlyToggle = document.getElementById('imaging-only-toggle');
 const authorSearchInput = document.getElementById('author-search-input');
 const authorSearchResults = document.getElementById('author-search-results');
@@ -1580,8 +1568,6 @@ imagingOnlyToggle.checked = imagingOnlyEnabled;
 pointSizeSlider.value = String(pointSize);
 pointSizeValue.textContent = String(pointSize);
 interactionModeSelect.value = interactionMode;
-umap3DToggle.checked = is3DMode;
-interactionModeSelect.disabled = false;
 
 function authorResultScore(query, summary) {{
   if (!query) return 0;
@@ -1821,7 +1807,9 @@ modeSelect.addEventListener('change', () => {{
 function switchProjection(projIdx) {{
   currentProjection = projIdx;
   syncDataCoordinates();
-  Plotly.restyle('umap-plot', {{ x: [activeXs()], y: [activeYs()], z: [activeZs()] }}, [0]);
+  const coordinateUpdate = {{ x: [activeXs()], y: [activeYs()] }};
+  if (isRotateMode()) coordinateUpdate.z = [activeZs()];
+  Plotly.restyle('umap-plot', coordinateUpdate, [0]);
   if (citationNetworkEnabled) {{
     drawCitationNetwork(selectedPointIndex !== null ? DATA[selectedPointIndex].paper_id : null);
   }} else if (selectedPointIndex !== null) {{
@@ -1831,28 +1819,8 @@ function switchProjection(projIdx) {{
   }}
 }}
 
-function updateDimensionControls() {{
-  interactionModeSelect.disabled = false;
-}}
-
-function set3DMode(enabled) {{
-  is3DMode = Boolean(enabled);
-  umap3DToggle.checked = is3DMode;
-  updateDimensionControls();
-  persistViewDimension();
-  const layoutUpdate = {{ 'scene.dragmode': is3DMode ? 'orbit' : interactionMode }};
-  if (!is3DMode) {{
-    layoutUpdate['scene.camera'] = getSceneCamera();
-  }}
-  Plotly.relayout('umap-plot', layoutUpdate);
-}}
-
 projectionSelect.addEventListener('change', () => {{
   switchProjection(parseInt(projectionSelect.value, 10));
-}});
-
-umap3DToggle.addEventListener('change', () => {{
-  set3DMode(umap3DToggle.checked);
 }});
 
 citationNetworkToggle.addEventListener('change', () => {{
@@ -1875,11 +1843,10 @@ pointSizeSlider.addEventListener('input', () => {{
 }});
 
 interactionModeSelect.addEventListener('change', () => {{
-  interactionMode = interactionModeSelect.value === 'zoom' ? 'zoom' : 'pan';
+  const value = interactionModeSelect.value;
+  interactionMode = value === 'zoom' || value === 'rotate' ? value : 'pan';
   persistInteractionMode();
-  if (!is3DMode) {{
-    Plotly.relayout('umap-plot', {{ 'scene.dragmode': interactionMode }});
-  }}
+  redrawBasePlot();
 }});
 
 authorSearchInput.addEventListener('input', renderAuthorResults);
@@ -1948,8 +1915,10 @@ const plot = document.getElementById('umap-plot');
 plot.on('plotly_click', ev => {{
   if (!ev || !ev.points || !ev.points.length) return;
   if (ev.points[0].curveNumber !== 0) return;
-  const i = ev.points[0].pointIndex;
+  const i = ev.points[0].pointIndex ?? ev.points[0].pointNumber;
+  if (i === undefined || i === null) return;
   const d = DATA[i];
+  if (!d) return;
   if (!isDatumVisible(d, modeSelect.value)) return;
   selectedPointIndex = i;
   setPanelHidden(false);
