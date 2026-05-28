@@ -1285,12 +1285,6 @@ function buildScatterTrace() {{
 }}
 
 function getSceneCamera() {{
-  if (is3DMode) {{
-    return {{
-      eye: {{ x: 1.35, y: 1.35, z: 0.95 }},
-      projection: {{ type: 'perspective' }},
-    }};
-  }}
   return {{
     up: {{ x: 0, y: 1, z: 0 }},
     center: {{ x: 0, y: 0, z: 0 }},
