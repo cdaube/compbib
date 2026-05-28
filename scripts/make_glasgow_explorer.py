@@ -1805,6 +1805,7 @@ modeSelect.addEventListener('change', () => {{
 
 // ── UMAP projection switching ─────────────────────────────────────
 function switchProjection(projIdx) {{
+  stopInertialSpin();
   currentProjection = projIdx;
   syncDataCoordinates();
   const coordinateUpdate = {{ x: [activeXs()], y: [activeYs()] }};
@@ -1843,6 +1844,7 @@ pointSizeSlider.addEventListener('input', () => {{
 }});
 
 interactionModeSelect.addEventListener('change', () => {{
+  stopInertialSpin();
   const value = interactionModeSelect.value;
   interactionMode = value === 'zoom' || value === 'rotate' ? value : 'pan';
   persistInteractionMode();
@@ -1911,6 +1913,132 @@ function renderDetail(d) {{
 
 // ── click + hover ────────────────────────────────────────────────
 const plot = document.getElementById('umap-plot');
+
+// ── inertial 3D rotation ─────────────────────────────────────────
+let spinFrameId = null;
+let rotatePointerState = {{
+  active: false,
+  lastX: 0,
+  lastTime: 0,
+  velocityX: 0,
+  moved: false,
+}};
+
+function clamp(value, min, max) {{
+  return Math.max(min, Math.min(max, value));
+}}
+
+function cloneCamera(camera) {{
+  const fallback = getSceneCamera();
+  const source = camera || fallback;
+  const eye = source.eye || fallback.eye;
+  const up = source.up || fallback.up;
+  const center = source.center || fallback.center;
+  const projection = source.projection || fallback.projection;
+  return {{
+    eye: {{ x: eye.x || 0, y: eye.y || 0, z: eye.z || 0 }},
+    up: {{ x: up.x || 0, y: up.y || 0, z: up.z || 0 }},
+    center: {{ x: center.x || 0, y: center.y || 0, z: center.z || 0 }},
+    projection: {{ type: projection.type || 'orthographic' }},
+  }};
+}}
+
+function currentSceneCamera() {{
+  const layout = plot && plot._fullLayout;
+  const scene = layout && layout.scene;
+  return cloneCamera(scene && scene.camera);
+}}
+
+function rotateXY(vector, angle) {{
+  const c = Math.cos(angle);
+  const s = Math.sin(angle);
+  return {{
+    x: vector.x * c - vector.y * s,
+    y: vector.x * s + vector.y * c,
+    z: vector.z,
+  }};
+}}
+
+function rotateCameraAroundZ(camera, angle) {{
+  return {{
+    ...camera,
+    eye: rotateXY(camera.eye, angle),
+    up: rotateXY(camera.up, angle),
+  }};
+}}
+
+function stopInertialSpin() {{
+  if (spinFrameId !== null) {{
+    cancelAnimationFrame(spinFrameId);
+    spinFrameId = null;
+  }}
+}}
+
+function startInertialSpin(pixelVelocityX) {{
+  if (!isRotateMode()) return;
+  stopInertialSpin();
+  let angularVelocity = clamp(pixelVelocityX * 0.004, -0.012, 0.012);
+  if (Math.abs(angularVelocity) < 0.0008) return;
+  let lastFrameTime = performance.now();
+
+  function step(now) {{
+    if (!isRotateMode()) {{
+      stopInertialSpin();
+      return;
+    }}
+    const dt = Math.min(32, Math.max(1, now - lastFrameTime));
+    lastFrameTime = now;
+    const camera = rotateCameraAroundZ(currentSceneCamera(), angularVelocity * dt);
+    Plotly.relayout('umap-plot', {{ 'scene.camera': camera }});
+    angularVelocity *= Math.exp(-dt / 900);
+    if (Math.abs(angularVelocity) > 0.00004) {{
+      spinFrameId = requestAnimationFrame(step);
+    }} else {{
+      spinFrameId = null;
+    }}
+  }}
+
+  spinFrameId = requestAnimationFrame(step);
+}}
+
+plot.addEventListener('pointerdown', ev => {{
+  if (!isRotateMode()) return;
+  stopInertialSpin();
+  rotatePointerState = {{
+    active: true,
+    lastX: ev.clientX,
+    lastTime: performance.now(),
+    velocityX: 0,
+    moved: false,
+  }};
+}}, true);
+
+window.addEventListener('pointermove', ev => {{
+  if (!rotatePointerState.active || !isRotateMode()) return;
+  const now = performance.now();
+  const dt = Math.max(1, now - rotatePointerState.lastTime);
+  const dx = ev.clientX - rotatePointerState.lastX;
+  const instantVelocity = dx / dt;
+  rotatePointerState.velocityX = rotatePointerState.velocityX * 0.65 + instantVelocity * 0.35;
+  rotatePointerState.moved = rotatePointerState.moved || Math.abs(dx) > 2;
+  rotatePointerState.lastX = ev.clientX;
+  rotatePointerState.lastTime = now;
+}}, true);
+
+function finishRotatePointer() {{
+  if (!rotatePointerState.active) return;
+  const velocityX = rotatePointerState.velocityX;
+  const moved = rotatePointerState.moved;
+  rotatePointerState.active = false;
+  if (moved) {{
+    setTimeout(() => startInertialSpin(velocityX), 40);
+  }}
+}}
+
+window.addEventListener('pointerup', finishRotatePointer, true);
+window.addEventListener('pointercancel', () => {{
+  rotatePointerState.active = false;
+}}, true);
 
 plot.on('plotly_click', ev => {{
   if (!ev || !ev.points || !ev.points.length) return;
