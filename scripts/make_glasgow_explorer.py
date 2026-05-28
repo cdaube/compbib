@@ -781,10 +781,10 @@ const IMAGING_ONLY_STORAGE_KEY = 'glasgow-explorer-imaging-only-v1';
 const POINT_SIZE_STORAGE_KEY = 'glasgow-explorer-point-size-v1';
 const INTERACTION_MODE_STORAGE_KEY = 'glasgow-explorer-interaction-mode-v1';
 const VIEW_DIMENSION_STORAGE_KEY = 'glasgow-explorer-view-dimension-v1';
-const CITATION_LINE_COLORS = {{
-  network: 'rgba(71,85,105,0.14)',
-  outgoing: 'rgba(59,130,246,0.72)',
-  incoming: 'rgba(239,68,68,0.72)',
+const CITATION_LINE_STYLES = {{
+  network: {{ color: 'rgb(71,85,105)', opacity: 0.14 }},
+  outgoing: {{ color: 'rgb(59,130,246)', opacity: 0.72 }},
+  incoming: {{ color: 'rgb(239,68,68)', opacity: 0.72 }},
 }};
 
 const IMAGING_KEYWORDS = [
@@ -1248,15 +1248,15 @@ function getLegendItems(mode) {{
 }}
 
 function activeXs() {{
-  return is3DMode ? UMAP_3D.xs[currentProjection] : UMAP_PROJECTIONS.xs[currentProjection];
+  return UMAP_3D.xs[currentProjection];
 }}
 
 function activeYs() {{
-  return is3DMode ? UMAP_3D.ys[currentProjection] : UMAP_PROJECTIONS.ys[currentProjection];
+  return UMAP_3D.ys[currentProjection];
 }}
 
 function activeZs() {{
-  return is3DMode ? UMAP_3D.zs[currentProjection] : null;
+  return UMAP_3D.zs[currentProjection];
 }}
 
 function syncDataCoordinates() {{
@@ -1271,46 +1271,49 @@ function syncDataCoordinates() {{
 }}
 
 function buildScatterTrace() {{
-  const trace = {{
+  return {{
     x: activeXs(),
     y: activeYs(),
+    z: activeZs(),
     mode: 'markers',
-    type: is3DMode ? 'scatter3d' : 'scattergl',
+    type: 'scatter3d',
     marker: {{ size: getMarkerSizes(), opacity: 0.5, color: getColors(getCurrentMode()) }},
     text: texts,
     hovertemplate: '<b>%{{text}}</b><extra></extra>',
     hoverinfo: 'text',
   }};
-  if (is3DMode) trace.z = activeZs();
-  return trace;
+}}
+
+function getSceneCamera() {{
+  if (is3DMode) {{
+    return {{
+      eye: {{ x: 1.35, y: 1.35, z: 0.95 }},
+      projection: {{ type: 'perspective' }},
+    }};
+  }}
+  return {{
+    up: {{ x: 0, y: 1, z: 0 }},
+    center: {{ x: 0, y: 0, z: 0 }},
+    eye: {{ x: 0, y: 0, z: 2.2 }},
+    projection: {{ type: 'orthographic' }},
+  }};
 }}
 
 function getPlotLayout() {{
-  const base = {{
+  return {{
     paper_bgcolor: '#ffffff',
     plot_bgcolor: '#ffffff',
     margin: {{ l: 5, r: 5, t: 5, b: 5 }},
     showlegend: false,
     hovermode: 'closest',
-  }};
-  if (is3DMode) {{
-    return {{
-      ...base,
-      scene: {{
-        xaxis: {{ visible: false }},
-        yaxis: {{ visible: false }},
-        zaxis: {{ visible: false }},
-        aspectmode: 'data',
-        dragmode: 'turntable',
-        camera: {{ eye: {{ x: 1.35, y: 1.35, z: 0.95 }} }},
-      }},
-    }};
-  }}
-  return {{
-    ...base,
-    xaxis: {{ visible: false }},
-    yaxis: {{ visible: false }},
-    dragmode: interactionMode,
+    scene: {{
+      xaxis: {{ visible: false }},
+      yaxis: {{ visible: false }},
+      zaxis: {{ visible: false }},
+      aspectmode: 'data',
+      dragmode: is3DMode ? 'turntable' : interactionMode,
+      camera: getSceneCamera(),
+    }},
   }};
 }}
 
@@ -1360,18 +1363,18 @@ function isEdgeVisible(sourcePaperId, targetPaperId) {{
   return isDatumVisible(DATA[sourceIdx], mode) && isDatumVisible(DATA[targetIdx], mode);
 }}
 
-function edgeLineTrace(ex, ey, ez, color, width) {{
-  const trace = {{
+function edgeLineTrace(ex, ey, ez, style, width) {{
+  return {{
     x: ex,
     y: ey,
+    z: ez,
     mode: 'lines',
-    type: is3DMode ? 'scatter3d' : 'scatter',
-    line: {{ color, width }},
+    type: 'scatter3d',
+    line: {{ color: style.color, width }},
+    opacity: style.opacity,
     hoverinfo: 'skip',
     showlegend: false,
   }};
-  if (is3DMode) trace.z = ez;
-  return trace;
 }}
 
 function buildSelectedEdgeTraces(paperId) {{
@@ -1394,7 +1397,7 @@ function buildSelectedEdgeTraces(paperId) {{
         ez.push(sz, DATA[ti].z || 0, null);
       }}
     }});
-    if (ex.length) traces.push(edgeLineTrace(ex, ey, ez, CITATION_LINE_COLORS.outgoing, 1.5));
+    if (ex.length) traces.push(edgeLineTrace(ex, ey, ez, CITATION_LINE_STYLES.outgoing, 1.5));
   }}
 
   const ins = citedBy[paperId] || [];
@@ -1408,7 +1411,7 @@ function buildSelectedEdgeTraces(paperId) {{
         ez.push(DATA[si].z || 0, sz, null);
       }}
     }});
-    if (ex.length) traces.push(edgeLineTrace(ex, ey, ez, CITATION_LINE_COLORS.incoming, 1.5));
+    if (ex.length) traces.push(edgeLineTrace(ex, ey, ez, CITATION_LINE_STYLES.incoming, 1.5));
   }}
 
   return traces;
@@ -1440,7 +1443,7 @@ function drawCitationNetwork(selectedPaperId = null) {{
 
   const traces = [];
   if (ex.length) {{
-    traces.push(edgeLineTrace(ex, ey, ez, CITATION_LINE_COLORS.network, 1.0));
+    traces.push(edgeLineTrace(ex, ey, ez, CITATION_LINE_STYLES.network, 1.0));
   }}
 
   if (selectedPaperId) {{
@@ -1583,7 +1586,7 @@ pointSizeSlider.value = String(pointSize);
 pointSizeValue.textContent = String(pointSize);
 interactionModeSelect.value = interactionMode;
 umap3DToggle.checked = is3DMode;
-interactionModeSelect.disabled = is3DMode;
+interactionModeSelect.disabled = false;
 
 function authorResultScore(query, summary) {{
   if (!query) return 0;
@@ -1823,13 +1826,7 @@ modeSelect.addEventListener('change', () => {{
 function switchProjection(projIdx) {{
   currentProjection = projIdx;
   syncDataCoordinates();
-  if (is3DMode) {{
-    redrawBasePlot();
-    return;
-  }}
-  const newXs = activeXs();
-  const newYs = activeYs();
-  Plotly.restyle('umap-plot', {{ x: [newXs], y: [newYs] }}, [0]);
+  Plotly.restyle('umap-plot', {{ x: [activeXs()], y: [activeYs()], z: [activeZs()] }}, [0]);
   if (citationNetworkEnabled) {{
     drawCitationNetwork(selectedPointIndex !== null ? DATA[selectedPointIndex].paper_id : null);
   }} else if (selectedPointIndex !== null) {{
@@ -1840,7 +1837,7 @@ function switchProjection(projIdx) {{
 }}
 
 function updateDimensionControls() {{
-  interactionModeSelect.disabled = is3DMode;
+  interactionModeSelect.disabled = false;
 }}
 
 function set3DMode(enabled) {{
@@ -1881,7 +1878,9 @@ pointSizeSlider.addEventListener('input', () => {{
 interactionModeSelect.addEventListener('change', () => {{
   interactionMode = interactionModeSelect.value === 'zoom' ? 'zoom' : 'pan';
   persistInteractionMode();
-  Plotly.relayout('umap-plot', {{ dragmode: interactionMode }});
+  if (!is3DMode) {{
+    Plotly.relayout('umap-plot', {{ 'scene.dragmode': interactionMode }});
+  }}
 }});
 
 authorSearchInput.addEventListener('input', renderAuthorResults);
