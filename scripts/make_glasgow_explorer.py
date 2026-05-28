@@ -1916,13 +1916,25 @@ const plot = document.getElementById('umap-plot');
 
 // ── inertial 3D rotation ─────────────────────────────────────────
 let spinFrameId = null;
+let spinStartTimeoutId = null;
 let rotatePointerState = {{
   active: false,
+  startX: 0,
+  startTime: 0,
   lastX: 0,
   lastTime: 0,
   velocityX: 0,
   moved: false,
 }};
+
+const SPIN_SENSITIVITY = -0.00125;
+const SPIN_MAX_VELOCITY = 0.0035;
+const SPIN_MIN_START_VELOCITY = 0.00035;
+const SPIN_STOP_VELOCITY = 0.000025;
+const SPIN_DECAY_MS = 620;
+const SPIN_SETTLE_DELAY_MS = 120;
+const SPIN_MIN_DRAG_PX = 14;
+const SPIN_MIN_DRAG_MS = 90;
 
 function clamp(value, min, max) {{
   return Math.max(min, Math.min(max, value));
@@ -1968,6 +1980,10 @@ function rotateCameraAroundZ(camera, angle) {{
 }}
 
 function stopInertialSpin() {{
+  if (spinStartTimeoutId !== null) {{
+    clearTimeout(spinStartTimeoutId);
+    spinStartTimeoutId = null;
+  }}
   if (spinFrameId !== null) {{
     cancelAnimationFrame(spinFrameId);
     spinFrameId = null;
@@ -1977,8 +1993,8 @@ function stopInertialSpin() {{
 function startInertialSpin(pixelVelocityX) {{
   if (!isRotateMode()) return;
   stopInertialSpin();
-  let angularVelocity = clamp(pixelVelocityX * 0.004, -0.012, 0.012);
-  if (Math.abs(angularVelocity) < 0.0008) return;
+  let angularVelocity = clamp(pixelVelocityX * SPIN_SENSITIVITY, -SPIN_MAX_VELOCITY, SPIN_MAX_VELOCITY);
+  if (Math.abs(angularVelocity) < SPIN_MIN_START_VELOCITY) return;
   let lastFrameTime = performance.now();
 
   function step(now) {{
@@ -1990,8 +2006,8 @@ function startInertialSpin(pixelVelocityX) {{
     lastFrameTime = now;
     const camera = rotateCameraAroundZ(currentSceneCamera(), angularVelocity * dt);
     Plotly.relayout('umap-plot', {{ 'scene.camera': camera }});
-    angularVelocity *= Math.exp(-dt / 900);
-    if (Math.abs(angularVelocity) > 0.00004) {{
+    angularVelocity *= Math.exp(-dt / SPIN_DECAY_MS);
+    if (Math.abs(angularVelocity) > SPIN_STOP_VELOCITY) {{
       spinFrameId = requestAnimationFrame(step);
     }} else {{
       spinFrameId = null;
@@ -2006,6 +2022,8 @@ plot.addEventListener('pointerdown', ev => {{
   stopInertialSpin();
   rotatePointerState = {{
     active: true,
+    startX: ev.clientX,
+    startTime: performance.now(),
     lastX: ev.clientX,
     lastTime: performance.now(),
     velocityX: 0,
@@ -2019,8 +2037,8 @@ window.addEventListener('pointermove', ev => {{
   const dt = Math.max(1, now - rotatePointerState.lastTime);
   const dx = ev.clientX - rotatePointerState.lastX;
   const instantVelocity = dx / dt;
-  rotatePointerState.velocityX = rotatePointerState.velocityX * 0.65 + instantVelocity * 0.35;
-  rotatePointerState.moved = rotatePointerState.moved || Math.abs(dx) > 2;
+  rotatePointerState.velocityX = rotatePointerState.velocityX * 0.86 + instantVelocity * 0.14;
+  rotatePointerState.moved = Math.abs(ev.clientX - rotatePointerState.startX) >= SPIN_MIN_DRAG_PX;
   rotatePointerState.lastX = ev.clientX;
   rotatePointerState.lastTime = now;
 }}, true);
@@ -2029,15 +2047,20 @@ function finishRotatePointer() {{
   if (!rotatePointerState.active) return;
   const velocityX = rotatePointerState.velocityX;
   const moved = rotatePointerState.moved;
+  const dragDuration = performance.now() - rotatePointerState.startTime;
   rotatePointerState.active = false;
-  if (moved) {{
-    setTimeout(() => startInertialSpin(velocityX), 40);
+  if (moved && dragDuration >= SPIN_MIN_DRAG_MS) {{
+    spinStartTimeoutId = setTimeout(() => {{
+      spinStartTimeoutId = null;
+      startInertialSpin(velocityX);
+    }}, SPIN_SETTLE_DELAY_MS);
   }}
 }}
 
 window.addEventListener('pointerup', finishRotatePointer, true);
 window.addEventListener('pointercancel', () => {{
   rotatePointerState.active = false;
+  stopInertialSpin();
 }}, true);
 
 plot.on('plotly_click', ev => {{
