@@ -9,7 +9,7 @@ Writes:
   data/glasgow_embeddings.npy
   data/glasgow_umap_coords.npy
   data/glasgow_umap_coords_multi.npy
-  data/glasgow_umap_coords_3d.npy
+  data/glasgow_umap_coords_3d_multi.npy
   glasgow_explorer.html
 
 Usage:
@@ -40,7 +40,7 @@ ABSTRACTS_CSV = os.path.join(DATA_DIR, "glasgow_abstracts.csv")
 EMBEDDINGS_FILE = os.path.join(DATA_DIR, "glasgow_embeddings.npy")
 UMAP_FILE = os.path.join(DATA_DIR, "glasgow_umap_coords.npy")
 UMAP_MULTI_FILE = os.path.join(DATA_DIR, "glasgow_umap_coords_multi.npy")
-UMAP_3D_FILE = os.path.join(DATA_DIR, "glasgow_umap_coords_3d.npy")
+UMAP_3D_MULTI_FILE = os.path.join(DATA_DIR, "glasgow_umap_coords_3d_multi.npy")
 MANIFEST_FILE = os.path.join(DATA_DIR, ".glasgow_explorer_data_manifest.json")
 
 MODEL_NAME = "nomic-ai/nomic-embed-text-v1.5"
@@ -173,7 +173,7 @@ def compute_umaps(embeddings: np.ndarray, force: bool) -> None:
     if (
         umap_cache_is_current(UMAP_FILE, (n_papers, 2), force)
         and umap_cache_is_current(UMAP_MULTI_FILE, (N_UMAP_RUNS, n_papers, 2), force)
-        and umap_cache_is_current(UMAP_3D_FILE, (n_papers, 3), force)
+        and umap_cache_is_current(UMAP_3D_MULTI_FILE, (N_UMAP_RUNS, n_papers, 3), force)
     ):
         print("Loaded current UMAP caches.")
         return
@@ -202,18 +202,21 @@ def compute_umaps(embeddings: np.ndarray, force: bool) -> None:
         print(f"Saved {UMAP_FILE} {multi[0].shape}")
         print(f"Saved {UMAP_MULTI_FILE} {multi.shape}")
 
-    if not umap_cache_is_current(UMAP_3D_FILE, (n_papers, 3), force):
-        print("Computing 3D UMAP (seed=0)...")
-        reducer = umap.UMAP(
-            n_neighbors=15,
-            min_dist=0.1,
-            metric="cosine",
-            n_components=3,
-            random_state=0,
-        )
-        coords_3d = reducer.fit_transform(embeddings).astype(np.float32)
-        np.save(UMAP_3D_FILE, coords_3d)
-        print(f"Saved {UMAP_3D_FILE} {coords_3d.shape}")
+    if not umap_cache_is_current(UMAP_3D_MULTI_FILE, (N_UMAP_RUNS, n_papers, 3), force):
+        runs_3d = []
+        for seed in range(N_UMAP_RUNS):
+            print(f"Computing 3D UMAP {seed + 1}/{N_UMAP_RUNS} (seed={seed})...")
+            reducer = umap.UMAP(
+                n_neighbors=15,
+                min_dist=0.1,
+                metric="cosine",
+                n_components=3,
+                random_state=seed,
+            )
+            runs_3d.append(reducer.fit_transform(embeddings).astype(np.float32))
+        multi_3d = np.stack(runs_3d, axis=0)
+        np.save(UMAP_3D_MULTI_FILE, multi_3d)
+        print(f"Saved {UMAP_3D_MULTI_FILE} {multi_3d.shape}")
 
 
 def build_html() -> None:

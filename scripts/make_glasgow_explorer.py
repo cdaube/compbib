@@ -284,36 +284,22 @@ def build_school_color_map():
 N_UMAP_RUNS = 10
 
 
-def _compute_multi_umap(embeddings, n_runs=N_UMAP_RUNS):
+def _compute_multi_umap(embeddings, n_runs=N_UMAP_RUNS, n_components=2):
     """Compute n_runs UMAP projections with seeds 0..n_runs-1."""
     import umap as umap_lib
-    print(f"  Computing {n_runs} UMAP projections (this may take several minutes)...")
+    print(f"  Computing {n_runs} {n_components}D UMAP projections (this may take several minutes)...")
     runs = []
     for seed in range(n_runs):
-        print(f"    Run {seed + 1}/{n_runs} (seed={seed})...")
+        print(f"    {n_components}D UMAP {seed + 1}/{n_runs} (seed={seed})...")
         reducer = umap_lib.UMAP(
             n_neighbors=15,
             min_dist=0.1,
             metric="cosine",
-            n_components=2,
+            n_components=n_components,
             random_state=seed,
         )
         runs.append(reducer.fit_transform(embeddings))
-    return np.stack(runs, axis=0)  # [n_runs, N, 2]
-
-
-def _compute_umap_3d(embeddings):
-    """Compute one 3D UMAP projection for the rotatable explorer view."""
-    import umap as umap_lib
-    print("  Computing 3D UMAP projection...")
-    reducer = umap_lib.UMAP(
-        n_neighbors=15,
-        min_dist=0.1,
-        metric="cosine",
-        n_components=3,
-        random_state=0,
-    )
-    return reducer.fit_transform(embeddings)
+    return np.stack(runs, axis=0)  # [n_runs, N, n_components]
 
 
 def main():
@@ -338,10 +324,10 @@ def main():
     # 1b. Load or compute multi-UMAP (10 projections with different seeds)
     # ------------------------------------------------------------------
     multi_file = os.path.join(DATA_DIR, "glasgow_umap_coords_multi.npy")
-    umap_3d_file = os.path.join(DATA_DIR, "glasgow_umap_coords_3d.npy")
+    umap_3d_multi_file = os.path.join(DATA_DIR, "glasgow_umap_coords_3d_multi.npy")
     emb_file = os.path.join(DATA_DIR, "glasgow_embeddings.npy")
     multi_coords = None
-    coords_3d = None
+    multi_coords_3d = None
 
     if os.path.exists(multi_file):
         _mc = np.load(multi_file)
@@ -355,39 +341,40 @@ def main():
         if os.path.exists(emb_file):
             print("  Loading embeddings for multi-UMAP computation...")
             embeddings = np.load(emb_file)
-            multi_coords = _compute_multi_umap(embeddings)
+            multi_coords = _compute_multi_umap(embeddings, n_components=2)
             np.save(multi_file, multi_coords)
             print(f"  Saved multi-UMAP: {multi_coords.shape} → {multi_file}")
         else:
             print("  No embeddings found; replicating single projection for all runs.")
             multi_coords = np.stack([coords] * N_UMAP_RUNS, axis=0)
 
-    if os.path.exists(umap_3d_file):
-        _coords_3d = np.load(umap_3d_file)
-        if _coords_3d.shape == (len(df), 3):
-            coords_3d = _coords_3d
-            print("  Loaded cached 3D UMAP projection.")
+    if os.path.exists(umap_3d_multi_file):
+        _mc3 = np.load(umap_3d_multi_file)
+        if _mc3.shape == (N_UMAP_RUNS, len(df), 3):
+            multi_coords_3d = _mc3
+            print(f"  Loaded {N_UMAP_RUNS} cached 3D UMAP projections.")
         else:
-            print(f"  3D UMAP cache shape {_coords_3d.shape} doesn't match; ignoring.")
+            print(f"  3D UMAP cache shape {_mc3.shape} doesn't match; ignoring.")
 
-    if coords_3d is None:
+    if multi_coords_3d is None:
         if os.path.exists(emb_file):
-            print("  Loading embeddings for 3D UMAP computation...")
+            print("  Loading embeddings for multi-3D UMAP computation...")
             embeddings = np.load(emb_file)
-            coords_3d = _compute_umap_3d(embeddings)
-            np.save(umap_3d_file, coords_3d)
-            print(f"  Saved 3D UMAP: {coords_3d.shape} → {umap_3d_file}")
+            multi_coords_3d = _compute_multi_umap(embeddings, n_components=3)
+            np.save(umap_3d_multi_file, multi_coords_3d)
+            print(f"  Saved multi-3D UMAP: {multi_coords_3d.shape} → {umap_3d_multi_file}")
         else:
-            print("  No embeddings found; deriving flat 3D projection from the first 2D projection.")
-            coords_3d = np.column_stack([coords, np.zeros(len(coords), dtype=np.float32)])
+            print("  No embeddings found; deriving flat 3D projections from the 2D projections.")
+            zeros = np.zeros((N_UMAP_RUNS, len(coords), 1), dtype=np.float32)
+            multi_coords_3d = np.concatenate([multi_coords.astype(np.float32), zeros], axis=2)
 
     # Attach all projection coords as df columns (survive the merge below)
     for _i in range(N_UMAP_RUNS):
         df[f"_ux{_i}"] = multi_coords[_i, :, 0].astype(np.float32)
         df[f"_uy{_i}"] = multi_coords[_i, :, 1].astype(np.float32)
-    df["_u3x"] = coords_3d[:, 0].astype(np.float32)
-    df["_u3y"] = coords_3d[:, 1].astype(np.float32)
-    df["_u3z"] = coords_3d[:, 2].astype(np.float32)
+        df[f"_u3x{_i}"] = multi_coords_3d[_i, :, 0].astype(np.float32)
+        df[f"_u3y{_i}"] = multi_coords_3d[_i, :, 1].astype(np.float32)
+        df[f"_u3z{_i}"] = multi_coords_3d[_i, :, 2].astype(np.float32)
 
     df["x"] = df["_ux0"]
     df["y"] = df["_uy0"]
@@ -493,12 +480,23 @@ def main():
         [round(float(df_reset.at[j, f"_uy{i}"]), 3) for j in range(len(df_reset))]
         for i in range(N_UMAP_RUNS)
     ]
+    umap_3d_xs = [
+        [round(float(df_reset.at[j, f"_u3x{i}"]), 3) for j in range(len(df_reset))]
+        for i in range(N_UMAP_RUNS)
+    ]
+    umap_3d_ys = [
+        [round(float(df_reset.at[j, f"_u3y{i}"]), 3) for j in range(len(df_reset))]
+        for i in range(N_UMAP_RUNS)
+    ]
+    umap_3d_zs = [
+        [round(float(df_reset.at[j, f"_u3z{i}"]), 3) for j in range(len(df_reset))]
+        for i in range(N_UMAP_RUNS)
+    ]
     umap_projections_json = json.dumps({"xs": umap_xs, "ys": umap_ys}, separators=(",", ":"))
-    umap_3d_json = json.dumps({
-        "x": [round(float(df_reset.at[j, "_u3x"]), 3) for j in range(len(df_reset))],
-        "y": [round(float(df_reset.at[j, "_u3y"]), 3) for j in range(len(df_reset))],
-        "z": [round(float(df_reset.at[j, "_u3z"]), 3) for j in range(len(df_reset))],
-    }, separators=(",", ":"))
+    umap_3d_json = json.dumps(
+        {"xs": umap_3d_xs, "ys": umap_3d_ys, "zs": umap_3d_zs},
+        separators=(",", ":"),
+    )
 
     # ------------------------------------------------------------------
     # 4. Build HTML
@@ -766,7 +764,7 @@ const SCHOOL_ORDER = {school_order_json};
 const SCHOOL_PICKER_COLORS = {school_picker_colors_json};
 const COLLEGE_COLORS = {college_color_map_json};
 const UMAP_PROJECTIONS = {umap_projections_json};  // {{xs: [[...], ...], ys: [[...], ...]}}
-const UMAP_3D = {umap_3d_json};  // {{x: [...], y: [...], z: [...]}}
+const UMAP_3D = {umap_3d_json};  // {{xs: [[...], ...], ys: [[...], ...], zs: [[...], ...]}}
 let currentProjection = 0;
 const N = DATA.length;
 const presentSchools = new Set(DATA.map(d => d.school).filter(Boolean));
@@ -783,6 +781,11 @@ const IMAGING_ONLY_STORAGE_KEY = 'glasgow-explorer-imaging-only-v1';
 const POINT_SIZE_STORAGE_KEY = 'glasgow-explorer-point-size-v1';
 const INTERACTION_MODE_STORAGE_KEY = 'glasgow-explorer-interaction-mode-v1';
 const VIEW_DIMENSION_STORAGE_KEY = 'glasgow-explorer-view-dimension-v1';
+const CITATION_LINE_COLORS = {{
+  network: 'rgba(71,85,105,0.14)',
+  outgoing: 'rgba(59,130,246,0.72)',
+  incoming: 'rgba(239,68,68,0.72)',
+}};
 
 const IMAGING_KEYWORDS = [
   'TMS','transcranial magnetic stimulation',
@@ -1245,15 +1248,15 @@ function getLegendItems(mode) {{
 }}
 
 function activeXs() {{
-  return is3DMode ? UMAP_3D.x : UMAP_PROJECTIONS.xs[currentProjection];
+  return is3DMode ? UMAP_3D.xs[currentProjection] : UMAP_PROJECTIONS.xs[currentProjection];
 }}
 
 function activeYs() {{
-  return is3DMode ? UMAP_3D.y : UMAP_PROJECTIONS.ys[currentProjection];
+  return is3DMode ? UMAP_3D.ys[currentProjection] : UMAP_PROJECTIONS.ys[currentProjection];
 }}
 
 function activeZs() {{
-  return is3DMode ? UMAP_3D.z : null;
+  return is3DMode ? UMAP_3D.zs[currentProjection] : null;
 }}
 
 function syncDataCoordinates() {{
@@ -1391,7 +1394,7 @@ function buildSelectedEdgeTraces(paperId) {{
         ez.push(sz, DATA[ti].z || 0, null);
       }}
     }});
-    if (ex.length) traces.push(edgeLineTrace(ex, ey, ez, 'rgba(59,130,246,0.72)', 1.5));
+    if (ex.length) traces.push(edgeLineTrace(ex, ey, ez, CITATION_LINE_COLORS.outgoing, 1.5));
   }}
 
   const ins = citedBy[paperId] || [];
@@ -1405,7 +1408,7 @@ function buildSelectedEdgeTraces(paperId) {{
         ez.push(DATA[si].z || 0, sz, null);
       }}
     }});
-    if (ex.length) traces.push(edgeLineTrace(ex, ey, ez, 'rgba(239,68,68,0.72)', 1.5));
+    if (ex.length) traces.push(edgeLineTrace(ex, ey, ez, CITATION_LINE_COLORS.incoming, 1.5));
   }}
 
   return traces;
@@ -1437,7 +1440,7 @@ function drawCitationNetwork(selectedPaperId = null) {{
 
   const traces = [];
   if (ex.length) {{
-    traces.push(edgeLineTrace(ex, ey, ez, 'rgba(71,85,105,0.14)', 1.0));
+    traces.push(edgeLineTrace(ex, ey, ez, CITATION_LINE_COLORS.network, 1.0));
   }}
 
   if (selectedPaperId) {{
@@ -1580,7 +1583,6 @@ pointSizeSlider.value = String(pointSize);
 pointSizeValue.textContent = String(pointSize);
 interactionModeSelect.value = interactionMode;
 umap3DToggle.checked = is3DMode;
-projectionSelect.disabled = is3DMode;
 interactionModeSelect.disabled = is3DMode;
 
 function authorResultScore(query, summary) {{
@@ -1820,8 +1822,11 @@ modeSelect.addEventListener('change', () => {{
 // ── UMAP projection switching ─────────────────────────────────────
 function switchProjection(projIdx) {{
   currentProjection = projIdx;
-  if (is3DMode) return;
   syncDataCoordinates();
+  if (is3DMode) {{
+    redrawBasePlot();
+    return;
+  }}
   const newXs = activeXs();
   const newYs = activeYs();
   Plotly.restyle('umap-plot', {{ x: [newXs], y: [newYs] }}, [0]);
@@ -1835,7 +1840,6 @@ function switchProjection(projIdx) {{
 }}
 
 function updateDimensionControls() {{
-  projectionSelect.disabled = is3DMode;
   interactionModeSelect.disabled = is3DMode;
 }}
 
