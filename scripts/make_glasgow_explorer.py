@@ -1249,6 +1249,7 @@ function syncDataCoordinates() {{
 
 function buildScatterTrace() {{
   const trace = {{
+    name: 'papers',
     x: activeXs(),
     y: activeYs(),
     mode: 'markers',
@@ -1301,7 +1302,7 @@ function getPlotLayout() {{
 }}
 
 function redrawBasePlot() {{
-  edgeTraceCount = 0;
+  pointTraceIndex = 0;
   syncDataCoordinates();
   return Plotly.react('umap-plot', [buildScatterTrace()], getPlotLayout(), {{
     responsive: true,
@@ -1327,14 +1328,43 @@ Plotly.newPlot('umap-plot', [buildScatterTrace()], getPlotLayout(), {{
 }});
 
 // ── edge traces management ───────────────────────────────────────
-let edgeTraceCount = 0;
+let pointTraceIndex = 0;
+function findPointTraceIndex() {{
+  const plotEl = document.getElementById('umap-plot');
+  const data = plotEl && plotEl.data ? plotEl.data : [];
+  const idx = data.findIndex(trace => trace.name === 'papers');
+  return idx >= 0 ? idx : pointTraceIndex;
+}}
+
+function restylePointTrace(update) {{
+  pointTraceIndex = findPointTraceIndex();
+  return Plotly.restyle('umap-plot', update, [pointTraceIndex]);
+}}
+
 function clearEdges() {{
-  if (edgeTraceCount > 0) {{
-    const indices = [];
-    const total = document.getElementById('umap-plot').data.length;
-    for (let i = total - edgeTraceCount; i < total; i++) indices.push(i);
+  const plotEl = document.getElementById('umap-plot');
+  const data = plotEl && plotEl.data ? plotEl.data : [];
+  pointTraceIndex = findPointTraceIndex();
+  const indices = data
+    .map((_, idx) => idx)
+    .filter(idx => idx !== pointTraceIndex);
+  if (indices.length) {{
     Plotly.deleteTraces('umap-plot', indices);
-    edgeTraceCount = 0;
+    pointTraceIndex = 0;
+  }}
+}}
+
+function keepPapersOnTop() {{
+  if (!isRotateMode()) {{
+    pointTraceIndex = findPointTraceIndex();
+    return;
+  }}
+  const plotEl = document.getElementById('umap-plot');
+  const total = plotEl && plotEl.data ? plotEl.data.length : 0;
+  pointTraceIndex = findPointTraceIndex();
+  if (total > 1 && pointTraceIndex !== total - 1) {{
+    Plotly.moveTraces('umap-plot', pointTraceIndex, total - 1);
+    pointTraceIndex = total - 1;
   }}
 }}
 
@@ -1405,8 +1435,7 @@ function drawSelectedEdges(paperId) {{
   clearEdges();
   const traces = buildSelectedEdgeTraces(paperId);
   if (traces.length) {{
-    Plotly.addTraces('umap-plot', traces);
-    edgeTraceCount = traces.length;
+    Plotly.addTraces('umap-plot', traces).then(keepPapersOnTop);
   }}
 }}
 
@@ -1435,8 +1464,7 @@ function drawCitationNetwork(selectedPaperId = null) {{
   }}
 
   if (traces.length) {{
-    Plotly.addTraces('umap-plot', traces);
-    edgeTraceCount = traces.length;
+    Plotly.addTraces('umap-plot', traces).then(keepPapersOnTop);
   }}
 }}
 
@@ -1649,7 +1677,7 @@ function renderAuthorResultButton(summary) {{
 
 function setActiveAuthor(authorName) {{
   activeAuthorName = authorName || '';
-  Plotly.restyle('umap-plot', {{ 'marker.color': [getColors(getCurrentMode())], 'marker.size': [getMarkerSizes()] }}, [0]);
+  restylePointTrace({{ 'marker.color': [getColors(getCurrentMode())], 'marker.size': [getMarkerSizes()] }});
   renderAuthorResults();
 }}
 
@@ -1659,7 +1687,7 @@ function applyColourState() {{
     selectedPointIndex = null;
     detailEl.textContent = 'Click a point to see its details.';
   }}
-  Plotly.restyle('umap-plot', {{ 'marker.color': [getColors(mode)], 'marker.size': [getMarkerSizes()] }}, [0]);
+  restylePointTrace({{ 'marker.color': [getColors(mode)], 'marker.size': [getMarkerSizes()] }});
   renderLegend(mode);
   renderAuthorResults();
   if (citationNetworkEnabled) {{
@@ -1810,7 +1838,7 @@ function switchProjection(projIdx) {{
   syncDataCoordinates();
   const coordinateUpdate = {{ x: [activeXs()], y: [activeYs()] }};
   if (isRotateMode()) coordinateUpdate.z = [activeZs()];
-  Plotly.restyle('umap-plot', coordinateUpdate, [0]);
+  restylePointTrace(coordinateUpdate);
   if (citationNetworkEnabled) {{
     drawCitationNetwork(selectedPointIndex !== null ? DATA[selectedPointIndex].paper_id : null);
   }} else if (selectedPointIndex !== null) {{
@@ -1920,11 +1948,7 @@ let spinStartTimeoutId = null;
 let rotatePointerState = {{
   active: false,
   startTime: 0,
-  lastAngle: 0,
-  lastTime: 0,
-  angularVelocity: 0,
-  totalAngle: 0,
-  moved: false,
+  startAngle: 0,
 }};
 
 const SPIN_MAX_VELOCITY = 0.0024;
@@ -2000,21 +2024,6 @@ function stopInertialSpin() {{
   }}
 }}
 
-function recordCameraRotation(now = performance.now()) {{
-  if (!rotatePointerState.active || !isRotateMode()) return;
-  const angle = cameraAzimuth(currentSceneCamera());
-  const dt = Math.max(1, now - rotatePointerState.lastTime);
-  const delta = angleDelta(angle, rotatePointerState.lastAngle);
-  if (Math.abs(delta) > 0.00001) {{
-    const instantVelocity = delta / dt;
-    rotatePointerState.angularVelocity = rotatePointerState.angularVelocity * 0.7 + instantVelocity * 0.3;
-    rotatePointerState.totalAngle += Math.abs(delta);
-    rotatePointerState.moved = rotatePointerState.totalAngle >= SPIN_MIN_DRAG_ANGLE;
-    rotatePointerState.lastAngle = angle;
-    rotatePointerState.lastTime = now;
-  }}
-}}
-
 function startInertialSpin(initialAngularVelocity) {{
   if (!isRotateMode()) return;
   stopInertialSpin();
@@ -2049,28 +2058,21 @@ plot.addEventListener('pointerdown', ev => {{
   rotatePointerState = {{
     active: true,
     startTime: now,
-    lastAngle: cameraAzimuth(currentSceneCamera()),
-    lastTime: now,
-    angularVelocity: 0,
-    totalAngle: 0,
-    moved: false,
+    startAngle: cameraAzimuth(currentSceneCamera()),
   }};
 }}, true);
-
-plot.on('plotly_relayout', () => {{
-  recordCameraRotation();
-}});
 
 function finishRotatePointer() {{
   if (!rotatePointerState.active) return;
   spinStartTimeoutId = setTimeout(() => {{
     spinStartTimeoutId = null;
-    recordCameraRotation();
-    const angularVelocity = rotatePointerState.angularVelocity;
-    const moved = rotatePointerState.moved;
-    const dragDuration = performance.now() - rotatePointerState.startTime;
+    const now = performance.now();
+    const endAngle = cameraAzimuth(currentSceneCamera());
+    const angle = angleDelta(endAngle, rotatePointerState.startAngle);
+    const dragDuration = now - rotatePointerState.startTime;
+    const angularVelocity = angle / Math.max(1, dragDuration);
     rotatePointerState.active = false;
-    if (moved && dragDuration >= SPIN_MIN_DRAG_MS) {{
+    if (Math.abs(angle) >= SPIN_MIN_DRAG_ANGLE && dragDuration >= SPIN_MIN_DRAG_MS) {{
       startInertialSpin(angularVelocity);
     }}
   }}, SPIN_SETTLE_DELAY_MS);
@@ -2084,7 +2086,8 @@ window.addEventListener('pointercancel', () => {{
 
 plot.on('plotly_click', ev => {{
   if (!ev || !ev.points || !ev.points.length) return;
-  if (ev.points[0].curveNumber !== 0) return;
+  pointTraceIndex = findPointTraceIndex();
+  if (ev.points[0].curveNumber !== pointTraceIndex) return;
   const i = ev.points[0].pointIndex ?? ev.points[0].pointNumber;
   if (i === undefined || i === null) return;
   const d = DATA[i];
