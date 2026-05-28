@@ -140,6 +140,8 @@ def normalize_doi(value: str | None) -> str:
     if doi.lower() == "nan":
         return ""
     doi = doi.strip().strip(".,;)'\"")
+    if not re.match(r"^10\.\d{4,9}/\S+$", doi, flags=re.I):
+        return ""
     return doi.lower()
 
 
@@ -201,13 +203,17 @@ def fetch_json(path: str, params: dict[str, Any] | None = None) -> dict[str, Any
             if attempt == MAX_RETRIES - 1:
                 raise
             status = exc.response.status_code if exc.response is not None else None
+            if status == 404:
+                raise
             if status == 429:
                 retry_after = exc.response.headers.get("Retry-After") if exc.response is not None else None
                 try:
                     wait = float(retry_after) if retry_after else 0
                 except ValueError:
                     wait = 0
-                time.sleep(max(wait, 30 * (attempt + 1)))
+                wait = max(wait, 30 * (attempt + 1))
+                print(f"OpenAlex 429; waiting {wait:.0f}s before retrying {path}", flush=True)
+                time.sleep(wait)
             else:
                 time.sleep(2 ** (attempt + 1))
         except Exception:
