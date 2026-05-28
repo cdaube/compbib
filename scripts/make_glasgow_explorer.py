@@ -302,6 +302,20 @@ def _compute_multi_umap(embeddings, n_runs=N_UMAP_RUNS):
     return np.stack(runs, axis=0)  # [n_runs, N, 2]
 
 
+def _compute_umap_3d(embeddings):
+    """Compute one 3D UMAP projection for the rotatable explorer view."""
+    import umap as umap_lib
+    print("  Computing 3D UMAP projection...")
+    reducer = umap_lib.UMAP(
+        n_neighbors=15,
+        min_dist=0.1,
+        metric="cosine",
+        n_components=3,
+        random_state=0,
+    )
+    return reducer.fit_transform(embeddings)
+
+
 def main():
     # ------------------------------------------------------------------
     # 1. Load & merge data
@@ -324,8 +338,10 @@ def main():
     # 1b. Load or compute multi-UMAP (10 projections with different seeds)
     # ------------------------------------------------------------------
     multi_file = os.path.join(DATA_DIR, "glasgow_umap_coords_multi.npy")
+    umap_3d_file = os.path.join(DATA_DIR, "glasgow_umap_coords_3d.npy")
     emb_file = os.path.join(DATA_DIR, "glasgow_embeddings.npy")
     multi_coords = None
+    coords_3d = None
 
     if os.path.exists(multi_file):
         _mc = np.load(multi_file)
@@ -346,10 +362,32 @@ def main():
             print("  No embeddings found; replicating single projection for all runs.")
             multi_coords = np.stack([coords] * N_UMAP_RUNS, axis=0)
 
+    if os.path.exists(umap_3d_file):
+        _coords_3d = np.load(umap_3d_file)
+        if _coords_3d.shape == (len(df), 3):
+            coords_3d = _coords_3d
+            print("  Loaded cached 3D UMAP projection.")
+        else:
+            print(f"  3D UMAP cache shape {_coords_3d.shape} doesn't match; ignoring.")
+
+    if coords_3d is None:
+        if os.path.exists(emb_file):
+            print("  Loading embeddings for 3D UMAP computation...")
+            embeddings = np.load(emb_file)
+            coords_3d = _compute_umap_3d(embeddings)
+            np.save(umap_3d_file, coords_3d)
+            print(f"  Saved 3D UMAP: {coords_3d.shape} → {umap_3d_file}")
+        else:
+            print("  No embeddings found; deriving flat 3D projection from the first 2D projection.")
+            coords_3d = np.column_stack([coords, np.zeros(len(coords), dtype=np.float32)])
+
     # Attach all projection coords as df columns (survive the merge below)
     for _i in range(N_UMAP_RUNS):
         df[f"_ux{_i}"] = multi_coords[_i, :, 0].astype(np.float32)
         df[f"_uy{_i}"] = multi_coords[_i, :, 1].astype(np.float32)
+    df["_u3x"] = coords_3d[:, 0].astype(np.float32)
+    df["_u3y"] = coords_3d[:, 1].astype(np.float32)
+    df["_u3z"] = coords_3d[:, 2].astype(np.float32)
 
     df["x"] = df["_ux0"]
     df["y"] = df["_uy0"]
@@ -456,6 +494,11 @@ def main():
         for i in range(N_UMAP_RUNS)
     ]
     umap_projections_json = json.dumps({"xs": umap_xs, "ys": umap_ys}, separators=(",", ":"))
+    umap_3d_json = json.dumps({
+        "x": [round(float(df_reset.at[j, "_u3x"]), 3) for j in range(len(df_reset))],
+        "y": [round(float(df_reset.at[j, "_u3y"]), 3) for j in range(len(df_reset))],
+        "z": [round(float(df_reset.at[j, "_u3z"]), 3) for j in range(len(df_reset))],
+    }, separators=(",", ":"))
 
     # ------------------------------------------------------------------
     # 4. Build HTML
@@ -469,6 +512,7 @@ def main():
         school_picker_colors_json=json.dumps(picker_palette, separators=(",", ":")),
         college_color_map_json=json.dumps(COLLEGE_COLORS, separators=(",", ":")),
         umap_projections_json=umap_projections_json,
+        umap_3d_json=umap_3d_json,
         n_umap_runs=N_UMAP_RUNS,
         n_papers=len(df),
     )
@@ -481,7 +525,7 @@ def main():
 
 def _build_html(*, data_json, edges_json, school_color_map_json,
                 school_order_json, school_picker_colors_json,
-                college_color_map_json, umap_projections_json,
+                college_color_map_json, umap_projections_json, umap_3d_json,
                 n_umap_runs, n_papers):
     projection_options = "\n    ".join(
         f'<option value="{i}">Run {i + 1}&thinsp;(seed&nbsp;{i})</option>'
@@ -621,6 +665,19 @@ a:hover{{text-decoration:underline}}
           </select>
         </div>
         <div class="control-block">
+          <div class="control-label">Dimension</div>
+          <label class="toggle-row" for="umap-3d-toggle">
+            <span class="toggle-copy">
+              <span class="toggle-title">3D UMAP</span>
+              <span class="toggle-sub">Switch to a rotatable three-dimensional projection.</span>
+            </span>
+            <span class="switch">
+              <input id="umap-3d-toggle" type="checkbox" />
+              <span class="switch-track"><span class="switch-thumb"></span></span>
+            </span>
+          </label>
+        </div>
+        <div class="control-block">
           <label class="control-label" for="interaction-mode">Interaction</label>
           <select id="interaction-mode" class="btn">
             <option value="pan">Move map</option>
@@ -709,6 +766,7 @@ const SCHOOL_ORDER = {school_order_json};
 const SCHOOL_PICKER_COLORS = {school_picker_colors_json};
 const COLLEGE_COLORS = {college_color_map_json};
 const UMAP_PROJECTIONS = {umap_projections_json};  // {{xs: [[...], ...], ys: [[...], ...]}}
+const UMAP_3D = {umap_3d_json};  // {{x: [...], y: [...], z: [...]}}
 let currentProjection = 0;
 const N = DATA.length;
 const presentSchools = new Set(DATA.map(d => d.school).filter(Boolean));
@@ -724,6 +782,7 @@ const CITATION_NETWORK_STORAGE_KEY = 'glasgow-explorer-citation-network-v1';
 const IMAGING_ONLY_STORAGE_KEY = 'glasgow-explorer-imaging-only-v1';
 const POINT_SIZE_STORAGE_KEY = 'glasgow-explorer-point-size-v1';
 const INTERACTION_MODE_STORAGE_KEY = 'glasgow-explorer-interaction-mode-v1';
+const VIEW_DIMENSION_STORAGE_KEY = 'glasgow-explorer-view-dimension-v1';
 
 const IMAGING_KEYWORDS = [
   'TMS','transcranial magnetic stimulation',
@@ -769,6 +828,7 @@ let imagingOnlyEnabled = false;
 let pointSize = 4;
 let interactionMode = 'pan';
 let activeAuthorName = '';
+let is3DMode = false;
 
 const imagingMask = DATA.map(d => IMAGING_REGEX.test(d.abstract || ''));
 
@@ -1062,6 +1122,22 @@ function persistInteractionMode() {{
   }}
 }}
 
+function loadViewDimension() {{
+  try {{
+    is3DMode = localStorage.getItem(VIEW_DIMENSION_STORAGE_KEY) === '3d';
+  }} catch (_err) {{
+    is3DMode = false;
+  }}
+}}
+
+function persistViewDimension() {{
+  try {{
+    localStorage.setItem(VIEW_DIMENSION_STORAGE_KEY, is3DMode ? '3d' : '2d');
+  }} catch (_err) {{
+    // Ignore browsers that block storage.
+  }}
+}}
+
 loadStoredSchoolColors();
 loadHiddenSchools();
 loadHiddenColleges();
@@ -1070,6 +1146,7 @@ loadCitationNetworkEnabled();
 loadImagingOnlyEnabled();
 loadPointSize();
 loadInteractionMode();
+loadViewDimension();
 
 function isSchoolVisible(school) {{
   return !hiddenSchools.has(school);
@@ -1167,33 +1244,94 @@ function getLegendItems(mode) {{
   return [];
 }}
 
+function activeXs() {{
+  return is3DMode ? UMAP_3D.x : UMAP_PROJECTIONS.xs[currentProjection];
+}}
+
+function activeYs() {{
+  return is3DMode ? UMAP_3D.y : UMAP_PROJECTIONS.ys[currentProjection];
+}}
+
+function activeZs() {{
+  return is3DMode ? UMAP_3D.z : null;
+}}
+
+function syncDataCoordinates() {{
+  const xs = activeXs();
+  const ys = activeYs();
+  const zs = activeZs();
+  DATA.forEach((d, i) => {{
+    d.x = xs[i];
+    d.y = ys[i];
+    d.z = zs ? zs[i] : 0;
+  }});
+}}
+
+function buildScatterTrace() {{
+  const trace = {{
+    x: activeXs(),
+    y: activeYs(),
+    mode: 'markers',
+    type: is3DMode ? 'scatter3d' : 'scattergl',
+    marker: {{ size: getMarkerSizes(), opacity: 0.5, color: getColors(getCurrentMode()) }},
+    text: texts,
+    hovertemplate: '<b>%{{text}}</b><extra></extra>',
+    hoverinfo: 'text',
+  }};
+  if (is3DMode) trace.z = activeZs();
+  return trace;
+}}
+
+function getPlotLayout() {{
+  const base = {{
+    paper_bgcolor: '#ffffff',
+    plot_bgcolor: '#ffffff',
+    margin: {{ l: 5, r: 5, t: 5, b: 5 }},
+    showlegend: false,
+    hovermode: 'closest',
+  }};
+  if (is3DMode) {{
+    return {{
+      ...base,
+      scene: {{
+        xaxis: {{ visible: false }},
+        yaxis: {{ visible: false }},
+        zaxis: {{ visible: false }},
+        aspectmode: 'data',
+        dragmode: 'turntable',
+        camera: {{ eye: {{ x: 1.35, y: 1.35, z: 0.95 }} }},
+      }},
+    }};
+  }}
+  return {{
+    ...base,
+    xaxis: {{ visible: false }},
+    yaxis: {{ visible: false }},
+    dragmode: interactionMode,
+  }};
+}}
+
+function redrawBasePlot() {{
+  edgeTraceCount = 0;
+  syncDataCoordinates();
+  return Plotly.react('umap-plot', [buildScatterTrace()], getPlotLayout(), {{
+    responsive: true,
+    displayModeBar: false,
+    scrollZoom: true,
+  }}).then(() => {{
+    if (citationNetworkEnabled) {{
+      drawCitationNetwork(selectedPointIndex !== null ? DATA[selectedPointIndex].paper_id : null);
+    }} else if (selectedPointIndex !== null) {{
+      drawSelectedEdges(DATA[selectedPointIndex].paper_id);
+    }}
+  }});
+}}
+
 // ── build initial plot ───────────────────────────────────────────
-const xs = DATA.map(d => d.x);
-const ys = DATA.map(d => d.y);
+syncDataCoordinates();
 const texts = DATA.map(d => (d.title || '').slice(0, 80) + '...');
 
-const scatterTrace = {{
-  x: xs, y: ys,
-  mode: 'markers',
-  type: 'scattergl',
-  marker: {{ size: getMarkerSizes(), opacity: 0.5, color: getColors('school') }},
-  text: texts,
-  hovertemplate: '<b>%{{text}}</b><extra></extra>',
-  hoverinfo: 'text',
-}};
-
-const layout = {{
-  paper_bgcolor: '#ffffff',
-  plot_bgcolor: '#ffffff',
-  margin: {{ l: 5, r: 5, t: 5, b: 5 }},
-  xaxis: {{ visible: false }},
-  yaxis: {{ visible: false }},
-  showlegend: false,
-  hovermode: 'closest',
-  dragmode: interactionMode,
-}};
-
-Plotly.newPlot('umap-plot', [scatterTrace], layout, {{
+Plotly.newPlot('umap-plot', [buildScatterTrace()], getPlotLayout(), {{
   responsive: true,
   displayModeBar: false,
   scrollZoom: true,
@@ -1219,46 +1357,55 @@ function isEdgeVisible(sourcePaperId, targetPaperId) {{
   return isDatumVisible(DATA[sourceIdx], mode) && isDatumVisible(DATA[targetIdx], mode);
 }}
 
+function edgeLineTrace(ex, ey, ez, color, width) {{
+  const trace = {{
+    x: ex,
+    y: ey,
+    mode: 'lines',
+    type: is3DMode ? 'scatter3d' : 'scatter',
+    line: {{ color, width }},
+    hoverinfo: 'skip',
+    showlegend: false,
+  }};
+  if (is3DMode) trace.z = ez;
+  return trace;
+}}
+
 function buildSelectedEdgeTraces(paperId) {{
   const srcIdx = paperIdx[paperId];
   if (srcIdx === undefined || !isDatumVisible(DATA[srcIdx], getCurrentMode(), srcIdx)) return [];
 
   const sx = DATA[srcIdx].x;
   const sy = DATA[srcIdx].y;
+  const sz = DATA[srcIdx].z || 0;
   const traces = [];
 
   const outs = citesOut[paperId] || [];
   if (outs.length) {{
-    const ex = [], ey = [];
+    const ex = [], ey = [], ez = [];
     outs.forEach(t => {{
       const ti = paperIdx[t];
       if (ti !== undefined && isEdgeVisible(paperId, t)) {{
         ex.push(sx, DATA[ti].x, null);
         ey.push(sy, DATA[ti].y, null);
+        ez.push(sz, DATA[ti].z || 0, null);
       }}
     }});
-    if (ex.length) traces.push({{
-      x: ex, y: ey, mode: 'lines', type: 'scatter',
-      line: {{ color: 'rgba(59,130,246,0.72)', width: 1.5 }},
-      hoverinfo: 'skip', showlegend: false,
-    }});
+    if (ex.length) traces.push(edgeLineTrace(ex, ey, ez, 'rgba(59,130,246,0.72)', 1.5));
   }}
 
   const ins = citedBy[paperId] || [];
   if (ins.length) {{
-    const ex = [], ey = [];
+    const ex = [], ey = [], ez = [];
     ins.forEach(s => {{
       const si = paperIdx[s];
       if (si !== undefined && isEdgeVisible(s, paperId)) {{
         ex.push(DATA[si].x, sx, null);
         ey.push(DATA[si].y, sy, null);
+        ez.push(DATA[si].z || 0, sz, null);
       }}
     }});
-    if (ex.length) traces.push({{
-      x: ex, y: ey, mode: 'lines', type: 'scatter',
-      line: {{ color: 'rgba(239,68,68,0.72)', width: 1.5 }},
-      hoverinfo: 'skip', showlegend: false,
-    }});
+    if (ex.length) traces.push(edgeLineTrace(ex, ey, ez, 'rgba(239,68,68,0.72)', 1.5));
   }}
 
   return traces;
@@ -1277,6 +1424,7 @@ function drawCitationNetwork(selectedPaperId = null) {{
   clearEdges();
   const ex = [];
   const ey = [];
+  const ez = [];
   EDGES.forEach(e => {{
     const [source, target] = e;
     if (!isEdgeVisible(source, target)) return;
@@ -1284,15 +1432,12 @@ function drawCitationNetwork(selectedPaperId = null) {{
     const targetIdx = paperIdx[target];
     ex.push(DATA[sourceIdx].x, DATA[targetIdx].x, null);
     ey.push(DATA[sourceIdx].y, DATA[targetIdx].y, null);
+    ez.push(DATA[sourceIdx].z || 0, DATA[targetIdx].z || 0, null);
   }});
 
   const traces = [];
   if (ex.length) {{
-    traces.push({{
-      x: ex, y: ey, mode: 'lines', type: 'scatter',
-      line: {{ color: 'rgba(71,85,105,0.14)', width: 1.0 }},
-      hoverinfo: 'skip', showlegend: false,
-    }});
+    traces.push(edgeLineTrace(ex, ey, ez, 'rgba(71,85,105,0.14)', 1.0));
   }}
 
   if (selectedPaperId) {{
@@ -1420,9 +1565,11 @@ const paletteClose = document.getElementById('palette-close');
 const paletteReset = document.getElementById('palette-reset');
 const paletteResetAll = document.getElementById('palette-reset-all');
 const citationNetworkToggle = document.getElementById('citation-network-toggle');
+const projectionSelect = document.getElementById('projection-select');
 const pointSizeSlider = document.getElementById('point-size-slider');
 const pointSizeValue = document.getElementById('point-size-value');
 const interactionModeSelect = document.getElementById('interaction-mode');
+const umap3DToggle = document.getElementById('umap-3d-toggle');
 const imagingOnlyToggle = document.getElementById('imaging-only-toggle');
 const authorSearchInput = document.getElementById('author-search-input');
 const authorSearchResults = document.getElementById('author-search-results');
@@ -1432,6 +1579,9 @@ imagingOnlyToggle.checked = imagingOnlyEnabled;
 pointSizeSlider.value = String(pointSize);
 pointSizeValue.textContent = String(pointSize);
 interactionModeSelect.value = interactionMode;
+umap3DToggle.checked = is3DMode;
+projectionSelect.disabled = is3DMode;
+interactionModeSelect.disabled = is3DMode;
 
 function authorResultScore(query, summary) {{
   if (!query) return 0;
@@ -1668,14 +1818,12 @@ modeSelect.addEventListener('change', () => {{
 }});
 
 // ── UMAP projection switching ─────────────────────────────────────
-const projectionSelect = document.getElementById('projection-select');
-
 function switchProjection(projIdx) {{
   currentProjection = projIdx;
-  const newXs = UMAP_PROJECTIONS.xs[projIdx];
-  const newYs = UMAP_PROJECTIONS.ys[projIdx];
-  // Keep DATA coords in sync (needed for edge rendering)
-  DATA.forEach((d, i) => {{ d.x = newXs[i]; d.y = newYs[i]; }});
+  if (is3DMode) return;
+  syncDataCoordinates();
+  const newXs = activeXs();
+  const newYs = activeYs();
   Plotly.restyle('umap-plot', {{ x: [newXs], y: [newYs] }}, [0]);
   if (citationNetworkEnabled) {{
     drawCitationNetwork(selectedPointIndex !== null ? DATA[selectedPointIndex].paper_id : null);
@@ -1686,8 +1834,25 @@ function switchProjection(projIdx) {{
   }}
 }}
 
+function updateDimensionControls() {{
+  projectionSelect.disabled = is3DMode;
+  interactionModeSelect.disabled = is3DMode;
+}}
+
+function set3DMode(enabled) {{
+  is3DMode = Boolean(enabled);
+  umap3DToggle.checked = is3DMode;
+  updateDimensionControls();
+  persistViewDimension();
+  redrawBasePlot();
+}}
+
 projectionSelect.addEventListener('change', () => {{
   switchProjection(parseInt(projectionSelect.value, 10));
+}});
+
+umap3DToggle.addEventListener('change', () => {{
+  set3DMode(umap3DToggle.checked);
 }});
 
 citationNetworkToggle.addEventListener('change', () => {{
@@ -1780,6 +1945,7 @@ const plot = document.getElementById('umap-plot');
 
 plot.on('plotly_click', ev => {{
   if (!ev || !ev.points || !ev.points.length) return;
+  if (ev.points[0].curveNumber !== 0) return;
   const i = ev.points[0].pointIndex;
   const d = DATA[i];
   if (!isDatumVisible(d, modeSelect.value)) return;
