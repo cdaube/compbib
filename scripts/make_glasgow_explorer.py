@@ -1839,7 +1839,11 @@ function set3DMode(enabled) {{
   umap3DToggle.checked = is3DMode;
   updateDimensionControls();
   persistViewDimension();
-  redrawBasePlot();
+  const layoutUpdate = {{ 'scene.dragmode': is3DMode ? 'turntable' : interactionMode }};
+  if (!is3DMode) {{
+    layoutUpdate['scene.camera'] = getSceneCamera();
+  }}
+  Plotly.relayout('umap-plot', layoutUpdate);
 }}
 
 projectionSelect.addEventListener('change', () => {{
