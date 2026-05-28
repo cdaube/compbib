@@ -1919,21 +1919,20 @@ let spinFrameId = null;
 let spinStartTimeoutId = null;
 let rotatePointerState = {{
   active: false,
-  startX: 0,
   startTime: 0,
-  lastX: 0,
+  lastAngle: 0,
   lastTime: 0,
-  velocityX: 0,
+  angularVelocity: 0,
+  totalAngle: 0,
   moved: false,
 }};
 
-const SPIN_SENSITIVITY = -0.00125;
-const SPIN_MAX_VELOCITY = 0.0035;
-const SPIN_MIN_START_VELOCITY = 0.00035;
+const SPIN_MAX_VELOCITY = 0.0024;
+const SPIN_MIN_START_VELOCITY = 0.00006;
 const SPIN_STOP_VELOCITY = 0.000025;
-const SPIN_DECAY_MS = 620;
+const SPIN_DECAY_MS = 700;
 const SPIN_SETTLE_DELAY_MS = 120;
-const SPIN_MIN_DRAG_PX = 14;
+const SPIN_MIN_DRAG_ANGLE = 0.025;
 const SPIN_MIN_DRAG_MS = 90;
 
 function clamp(value, min, max) {{
@@ -1979,6 +1978,17 @@ function rotateCameraAroundZ(camera, angle) {{
   }};
 }}
 
+function cameraAzimuth(camera) {{
+  return Math.atan2(camera.eye.y, camera.eye.x);
+}}
+
+function angleDelta(nextAngle, prevAngle) {{
+  let delta = nextAngle - prevAngle;
+  while (delta > Math.PI) delta -= Math.PI * 2;
+  while (delta < -Math.PI) delta += Math.PI * 2;
+  return delta;
+}}
+
 function stopInertialSpin() {{
   if (spinStartTimeoutId !== null) {{
     clearTimeout(spinStartTimeoutId);
@@ -1990,10 +2000,25 @@ function stopInertialSpin() {{
   }}
 }}
 
-function startInertialSpin(pixelVelocityX) {{
+function recordCameraRotation(now = performance.now()) {{
+  if (!rotatePointerState.active || !isRotateMode()) return;
+  const angle = cameraAzimuth(currentSceneCamera());
+  const dt = Math.max(1, now - rotatePointerState.lastTime);
+  const delta = angleDelta(angle, rotatePointerState.lastAngle);
+  if (Math.abs(delta) > 0.00001) {{
+    const instantVelocity = delta / dt;
+    rotatePointerState.angularVelocity = rotatePointerState.angularVelocity * 0.7 + instantVelocity * 0.3;
+    rotatePointerState.totalAngle += Math.abs(delta);
+    rotatePointerState.moved = rotatePointerState.totalAngle >= SPIN_MIN_DRAG_ANGLE;
+    rotatePointerState.lastAngle = angle;
+    rotatePointerState.lastTime = now;
+  }}
+}}
+
+function startInertialSpin(initialAngularVelocity) {{
   if (!isRotateMode()) return;
   stopInertialSpin();
-  let angularVelocity = clamp(pixelVelocityX * SPIN_SENSITIVITY, -SPIN_MAX_VELOCITY, SPIN_MAX_VELOCITY);
+  let angularVelocity = clamp(initialAngularVelocity, -SPIN_MAX_VELOCITY, SPIN_MAX_VELOCITY);
   if (Math.abs(angularVelocity) < SPIN_MIN_START_VELOCITY) return;
   let lastFrameTime = performance.now();
 
@@ -2020,41 +2045,35 @@ function startInertialSpin(pixelVelocityX) {{
 plot.addEventListener('pointerdown', ev => {{
   if (!isRotateMode()) return;
   stopInertialSpin();
+  const now = performance.now();
   rotatePointerState = {{
     active: true,
-    startX: ev.clientX,
-    startTime: performance.now(),
-    lastX: ev.clientX,
-    lastTime: performance.now(),
-    velocityX: 0,
+    startTime: now,
+    lastAngle: cameraAzimuth(currentSceneCamera()),
+    lastTime: now,
+    angularVelocity: 0,
+    totalAngle: 0,
     moved: false,
   }};
 }}, true);
 
-window.addEventListener('pointermove', ev => {{
-  if (!rotatePointerState.active || !isRotateMode()) return;
-  const now = performance.now();
-  const dt = Math.max(1, now - rotatePointerState.lastTime);
-  const dx = ev.clientX - rotatePointerState.lastX;
-  const instantVelocity = dx / dt;
-  rotatePointerState.velocityX = rotatePointerState.velocityX * 0.86 + instantVelocity * 0.14;
-  rotatePointerState.moved = Math.abs(ev.clientX - rotatePointerState.startX) >= SPIN_MIN_DRAG_PX;
-  rotatePointerState.lastX = ev.clientX;
-  rotatePointerState.lastTime = now;
-}}, true);
+plot.on('plotly_relayout', () => {{
+  recordCameraRotation();
+}});
 
 function finishRotatePointer() {{
   if (!rotatePointerState.active) return;
-  const velocityX = rotatePointerState.velocityX;
-  const moved = rotatePointerState.moved;
-  const dragDuration = performance.now() - rotatePointerState.startTime;
-  rotatePointerState.active = false;
-  if (moved && dragDuration >= SPIN_MIN_DRAG_MS) {{
-    spinStartTimeoutId = setTimeout(() => {{
-      spinStartTimeoutId = null;
-      startInertialSpin(velocityX);
-    }}, SPIN_SETTLE_DELAY_MS);
-  }}
+  spinStartTimeoutId = setTimeout(() => {{
+    spinStartTimeoutId = null;
+    recordCameraRotation();
+    const angularVelocity = rotatePointerState.angularVelocity;
+    const moved = rotatePointerState.moved;
+    const dragDuration = performance.now() - rotatePointerState.startTime;
+    rotatePointerState.active = false;
+    if (moved && dragDuration >= SPIN_MIN_DRAG_MS) {{
+      startInertialSpin(angularVelocity);
+    }}
+  }}, SPIN_SETTLE_DELAY_MS);
 }}
 
 window.addEventListener('pointerup', finishRotatePointer, true);
