@@ -1126,8 +1126,9 @@ function persistInteractionMode() {{
 }}
 
 function loadViewDimension() {{
+  is3DMode = false;
   try {{
-    is3DMode = localStorage.getItem(VIEW_DIMENSION_STORAGE_KEY) === '3d';
+    localStorage.removeItem(VIEW_DIMENSION_STORAGE_KEY);
   }} catch (_err) {{
     is3DMode = false;
   }}
@@ -1135,7 +1136,7 @@ function loadViewDimension() {{
 
 function persistViewDimension() {{
   try {{
-    localStorage.setItem(VIEW_DIMENSION_STORAGE_KEY, is3DMode ? '3d' : '2d');
+    localStorage.removeItem(VIEW_DIMENSION_STORAGE_KEY);
   }} catch (_err) {{
     // Ignore browsers that block storage.
   }}
@@ -1305,7 +1306,7 @@ function getPlotLayout() {{
       yaxis: {{ visible: false }},
       zaxis: {{ visible: false }},
       aspectmode: 'data',
-      dragmode: is3DMode ? 'turntable' : interactionMode,
+      dragmode: is3DMode ? 'orbit' : interactionMode,
       camera: getSceneCamera(),
     }},
   }};
@@ -1839,7 +1840,7 @@ function set3DMode(enabled) {{
   umap3DToggle.checked = is3DMode;
   updateDimensionControls();
   persistViewDimension();
-  const layoutUpdate = {{ 'scene.dragmode': is3DMode ? 'turntable' : interactionMode }};
+  const layoutUpdate = {{ 'scene.dragmode': is3DMode ? 'orbit' : interactionMode }};
   if (!is3DMode) {{
     layoutUpdate['scene.camera'] = getSceneCamera();
   }}
