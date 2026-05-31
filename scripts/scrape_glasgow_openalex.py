@@ -76,6 +76,17 @@ COAUTHOR_INCLUDE_SCORE = 35
 QUARANTINE_SCORE = 20
 CAREER_START_GRACE_YEARS = 3
 ORCID_EARLIEST_GRACE_YEARS = 12
+# Per-researcher date-sanity floor: a work whose year sits far below the
+# researcher's own body of work (and lacks any Glasgow affiliation) is almost
+# always an OpenAlex cluster merge of an older homonym. Drop those isolated
+# old outliers even when other evidence (incl. trusted DOIs) would include them.
+DATE_FLOOR_GRACE_YEARS = 15
+DATE_FLOOR_MIN_WORKS = 8
+# A below-floor work is normally kept if it carries any Glasgow affiliation (it
+# may be genuine early-career output). But a Glasgow-affiliated work separated
+# from the rest of the researcher's record by this many years is almost always
+# a different, earlier same-name Glasgow person merged in by OpenAlex.
+DATE_FLOOR_ISOLATION_GAP_YEARS = 25
 NON_PUBLICATION_TYPES = {
     "dataset",
     "peer-review",
@@ -438,6 +449,21 @@ def initial_last_match(query_name: str, candidate_name: str) -> bool:
     return query_parts[0][:1] == candidate_parts[0][:1] and query_parts[-1] == candidate_parts[-1]
 
 
+def core_name_tokens(name: str) -> list[str]:
+    """Name tokens with initials dropped (e.g. 'Andrew K. Reilly' -> ['andrew','reilly'])."""
+    parts = normalize_name(name).replace("-", " ").split()
+    return [p for p in parts if len(p) > 1]
+
+
+def same_core_name(query_name: str, candidate_name: str) -> bool:
+    """True when two names share the same non-initial token sequence.
+
+    Blocks compound-surname homonym merges such as 'Andrew Reilly' vs
+    'Andrew Luxton-Reilly' that first_last_match would otherwise treat as equal.
+    """
+    return bool(core_name_tokens(query_name)) and core_name_tokens(query_name) == core_name_tokens(candidate_name)
+
+
 def author_score(researcher: dict[str, str], candidate: dict[str, Any], glasgow_id: str) -> float:
     score = name_score(researcher["name"], candidate.get("display_name", ""))
     if has_glasgow_affiliation(candidate, glasgow_id):
@@ -478,6 +504,11 @@ def prefer_orcid_backed_duplicate(
         if not candidate.get("_has_glasgow") or not candidate.get("orcid"):
             continue
         if not first_last_match(researcher["name"], candidate.get("display_name", "")):
+            continue
+        # Require an exact core-name match before merging into a larger cluster,
+        # so a richer homonym (e.g. 'Andrew Luxton-Reilly') is not mistaken for
+        # the roster person ('Andrew Reilly').
+        if not same_core_name(researcher["name"], candidate.get("display_name", "")):
             continue
         works = author_count(candidate, "works_count")
         citations = author_count(candidate, "cited_by_count")
@@ -883,6 +914,58 @@ def score_work_identity(
     }
 
 
+def _percentile(values: list[int], q: float) -> float | None:
+    """Linear-interpolated percentile (q in [0, 1]); no numpy dependency."""
+    vals = sorted(values)
+    if not vals:
+        return None
+    if len(vals) == 1:
+        return float(vals[0])
+    pos = (len(vals) - 1) * q
+    lo = int(pos)
+    hi = min(lo + 1, len(vals) - 1)
+    frac = pos - lo
+    return vals[lo] * (1 - frac) + vals[hi] * frac
+
+
+def apply_date_floor(scored: list[dict[str, Any]]) -> int:
+    """Demote isolated, very-old included works to 'exclude'.
+
+    A work is dropped if its year sits more than DATE_FLOOR_GRACE_YEARS below the
+    researcher's 10th-percentile publication year and either (a) it carries no
+    Glasgow affiliation evidence, or (b) it is separated from the rest of the
+    researcher's record by at least DATE_FLOOR_ISOLATION_GAP_YEARS. Mutates the
+    evidence dicts in place and returns the number of works demoted.
+    """
+    included = [e for e in scored if e["identity_decision"] == "include"]
+    years = [int(e["year"]) for e in included if str(e.get("year", "")).strip().isdigit()]
+    if len(years) < DATE_FLOOR_MIN_WORKS:
+        return 0
+    p10 = _percentile(years, 0.10)
+    if p10 is None:
+        return 0
+    floor_year = p10 - DATE_FLOOR_GRACE_YEARS
+    sorted_years = sorted(years)
+    demoted = 0
+    for e in included:
+        year_text = str(e.get("year", "")).strip()
+        if not year_text.isdigit():
+            continue
+        year = int(year_text)
+        if year >= floor_year:
+            continue
+        if "glasgow_affiliation" in (e.get("identity_flags") or ""):
+            higher = [y for y in sorted_years if y > year]
+            gap = (min(higher) - year) if higher else 0
+            if gap < DATE_FLOOR_ISOLATION_GAP_YEARS:
+                continue
+        e["identity_decision"] = "exclude"
+        flags = e.get("identity_flags") or ""
+        e["identity_flags"] = (flags + "|" if flags else "") + f"date_outlier_below_floor:{int(floor_year)}"
+        demoted += 1
+    return demoted
+
+
 def work_row(work: dict[str, Any]) -> dict[str, Any]:
     ids = work.get("ids") or {}
     openalex_id = short_openalex_id(work.get("id", ""))
@@ -947,6 +1030,7 @@ def load_author_overrides() -> dict[str, dict[str, Any]]:
         if name and author_id and author_id.lower() != "nan":
             override = {
                 "author_id": author_id,
+                "exclude": author_id.strip().upper() == "EXCLUDE",
                 "profile_publications_url": str(row.get("profile_publications_url", "") or "").strip(),
                 "explicit_doi_allowlist": {
                     normalize_doi(doi)
@@ -1013,6 +1097,26 @@ def scrape(overwrite: bool = False) -> None:
 
     for researcher in tqdm(researchers, desc="Authors"):
         override = overrides.get(normalize_name(researcher["name"]))
+        if override and override.get("exclude"):
+            candidate_rows.append(
+                {
+                    "researcher_name": researcher["name"],
+                    "school": researcher["school"],
+                    "college": researcher["college"],
+                    "selected": False,
+                    "candidate_rank": "override",
+                    "score": "override",
+                    "has_glasgow_affiliation": "",
+                    "openalex_author_id": "EXCLUDE",
+                    "display_name": "(excluded by override)",
+                    "orcid": "",
+                    "works_count": "",
+                    "cited_by_count": "",
+                    "institutions": "",
+                }
+            )
+            unresolved.append(f"{researcher['name']} (excluded by override)")
+            continue
         explicit_dois: set[str] = set()
         profile_dois_set: set[str] = set()
         if override:
@@ -1073,7 +1177,8 @@ def scrape(overwrite: bool = False) -> None:
             trusted_dois,
             set(orcid_info.get("work_titles") or set()),
         )
-        kept = quarantined = excluded = 0
+        # Pass 1: score every candidate work for this researcher.
+        scored: list[tuple[dict[str, Any], dict[str, Any]]] = []
         for work in works:
             row = work_row(work)
             if not row["paper_id"] or not row["title"]:
@@ -1089,6 +1194,14 @@ def scrape(overwrite: bool = False) -> None:
                 orcid_info=orcid_info,
                 trusted_coauthors=trusted_coauthors,
             )
+            scored.append((evidence, row))
+
+        # Pass 2: drop isolated, implausibly-old works merged from a homonym.
+        demoted = apply_date_floor([evidence for evidence, _ in scored])
+
+        # Pass 3: commit decisions and record the audit rows.
+        kept = quarantined = excluded = 0
+        for evidence, row in scored:
             candidate_work_rows.append(evidence)
             evidence_rows.append(evidence)
             if evidence["identity_decision"] != "include":
@@ -1115,6 +1228,7 @@ def scrape(overwrite: bool = False) -> None:
             tqdm.write(
                 f"  Identity filter for {researcher['name']}: "
                 f"included {kept}, quarantined {quarantined}, excluded {excluded}"
+                + (f" ({demoted} old-outlier)" if demoted else "")
             )
 
     write_author_candidates(candidate_rows)

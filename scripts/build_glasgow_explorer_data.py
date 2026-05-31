@@ -10,7 +10,8 @@ Writes:
   data/glasgow_umap_coords.npy
   data/glasgow_umap_coords_multi.npy
   data/glasgow_umap_coords_3d_multi.npy
-  glasgow_explorer.html
+  glasgow_imaging_initiative_explorer.html
+  glasgow_explorer.html  (legacy URL)
 
 Usage:
     uv run python scripts/build_glasgow_explorer_data.py
@@ -221,7 +222,10 @@ def compute_umaps(embeddings: np.ndarray, force: bool) -> None:
 
 def build_html() -> None:
     print("Building explorer HTML...")
-    subprocess.run([sys.executable, os.path.join(BASE_DIR, "scripts", "make_glasgow_explorer.py")], check=True)
+    subprocess.run(
+        [sys.executable, os.path.join(BASE_DIR, "scripts", "make_glasgow_imaging_initiative_explorer.py")],
+        check=True,
+    )
 
 
 def main() -> None:

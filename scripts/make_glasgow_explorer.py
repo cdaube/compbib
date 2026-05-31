@@ -1,8 +1,8 @@
 """
-Build an interactive Glasgow UMAP explorer as a single self-contained HTML file.
+Build the Glasgow Imaging Initiative Explorer as a self-contained HTML file.
 
 Features:
-- Scatter plot of Glasgow researcher abstracts in UMAP space
+- Scatter plot of Glasgow Imaging Initiative researcher abstracts in UMAP space
 - Dropdown to switch colour mapping: School, College, Year, Citation network
 - Collapsible side panel with full abstract + metadata (coloured by school)
 - Citation edge overlays (cites → blue, cited-by → red)
@@ -22,8 +22,12 @@ import pandas as pd
 
 BASE_DIR = os.path.dirname(os.path.dirname(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
-OUT_DIR = BASE_DIR  # put index-glasgow.html at repo root for GitHub Pages
+OUT_DIR = BASE_DIR  # put public HTML at repo root for GitHub Pages
 os.makedirs(OUT_DIR, exist_ok=True)
+
+EXPLORER_TITLE = "Glasgow Imaging Initiative Explorer"
+PRIMARY_HTML = "glasgow_imaging_initiative_explorer.html"
+LEGACY_HTML = "glasgow_explorer.html"
 
 
 # ---------------------------------------------------------------------------
@@ -515,10 +519,11 @@ def main():
         n_papers=len(df),
     )
 
-    out_path = os.path.join(OUT_DIR, "glasgow_explorer.html")
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write(page)
-    print(f"Saved: {out_path}  ({len(page) / 1e6:.1f} MB)")
+    for filename in (PRIMARY_HTML, LEGACY_HTML):
+        out_path = os.path.join(OUT_DIR, filename)
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write(page)
+        print(f"Saved: {out_path}  ({len(page) / 1e6:.1f} MB)")
 
 
 def _build_html(*, data_json, edges_json, school_color_map_json,
@@ -534,7 +539,7 @@ def _build_html(*, data_json, edges_json, school_color_map_json,
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>Glasgow Research Explorer</title>
+<title>{EXPLORER_TITLE}</title>
 <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
 <style>
 *,*::before,*::after{{box-sizing:border-box}}
@@ -585,6 +590,8 @@ select.btn{{padding-right:24px}}
 body.panel-hidden .panel-pop{{display:block}}
 
 .panel-body{{flex:1;padding:16px;overflow-y:auto}}
+.app-brand{{margin:0 0 14px;padding:0 0 12px;border-bottom:1px solid #e2e8f0}}
+.app-brand h1{{margin:0;font-size:18px;line-height:1.2;color:#0f172a;font-weight:700}}
 .instructions{{font-size:13px;color:#64748b;margin-bottom:14px}}
 .paper-card{{border-radius:10px;padding:14px;margin-bottom:10px;background:#ffffff;border:1px solid #e2e8f0;border-left:4px solid #cbd5e1}}
 .paper-card h3{{margin:0 0 8px;font-size:15px;line-height:1.4;color:#0f172a}}
@@ -647,6 +654,9 @@ a:hover{{text-decoration:underline}}
       </div>
     </div>
     <div class="panel-body">
+      <div class="app-brand">
+        <h1>{EXPLORER_TITLE}</h1>
+      </div>
       <div class="control-stack">
         <div class="control-block">
           <label class="control-label" for="colour-mode">Colour</label>
@@ -1833,7 +1843,6 @@ modeSelect.addEventListener('change', () => {{
 
 // ── UMAP projection switching ─────────────────────────────────────
 function switchProjection(projIdx) {{
-  stopInertialSpin();
   currentProjection = projIdx;
   syncDataCoordinates();
   const coordinateUpdate = {{ x: [activeXs()], y: [activeYs()] }};
@@ -1872,7 +1881,6 @@ pointSizeSlider.addEventListener('input', () => {{
 }});
 
 interactionModeSelect.addEventListener('change', () => {{
-  stopInertialSpin();
   const value = interactionModeSelect.value;
   interactionMode = value === 'zoom' || value === 'rotate' ? value : 'pan';
   persistInteractionMode();
@@ -1941,148 +1949,6 @@ function renderDetail(d) {{
 
 // ── click + hover ────────────────────────────────────────────────
 const plot = document.getElementById('umap-plot');
-
-// ── inertial 3D rotation ─────────────────────────────────────────
-let spinFrameId = null;
-let spinStartTimeoutId = null;
-let rotatePointerState = {{
-  active: false,
-  startTime: 0,
-  startAngle: 0,
-}};
-
-const SPIN_MAX_VELOCITY = 0.0024;
-const SPIN_MIN_START_VELOCITY = 0.00006;
-const SPIN_STOP_VELOCITY = 0.000025;
-const SPIN_DECAY_MS = 700;
-const SPIN_SETTLE_DELAY_MS = 120;
-const SPIN_MIN_DRAG_ANGLE = 0.025;
-const SPIN_MIN_DRAG_MS = 90;
-
-function clamp(value, min, max) {{
-  return Math.max(min, Math.min(max, value));
-}}
-
-function cloneCamera(camera) {{
-  const fallback = getSceneCamera();
-  const source = camera || fallback;
-  const eye = source.eye || fallback.eye;
-  const up = source.up || fallback.up;
-  const center = source.center || fallback.center;
-  const projection = source.projection || fallback.projection;
-  return {{
-    eye: {{ x: eye.x || 0, y: eye.y || 0, z: eye.z || 0 }},
-    up: {{ x: up.x || 0, y: up.y || 0, z: up.z || 0 }},
-    center: {{ x: center.x || 0, y: center.y || 0, z: center.z || 0 }},
-    projection: {{ type: projection.type || 'orthographic' }},
-  }};
-}}
-
-function currentSceneCamera() {{
-  const layout = plot && plot._fullLayout;
-  const scene = layout && layout.scene;
-  return cloneCamera(scene && scene.camera);
-}}
-
-function rotateXY(vector, angle) {{
-  const c = Math.cos(angle);
-  const s = Math.sin(angle);
-  return {{
-    x: vector.x * c - vector.y * s,
-    y: vector.x * s + vector.y * c,
-    z: vector.z,
-  }};
-}}
-
-function rotateCameraAroundZ(camera, angle) {{
-  return {{
-    ...camera,
-    eye: rotateXY(camera.eye, angle),
-    up: rotateXY(camera.up, angle),
-  }};
-}}
-
-function cameraAzimuth(camera) {{
-  return Math.atan2(camera.eye.y, camera.eye.x);
-}}
-
-function angleDelta(nextAngle, prevAngle) {{
-  let delta = nextAngle - prevAngle;
-  while (delta > Math.PI) delta -= Math.PI * 2;
-  while (delta < -Math.PI) delta += Math.PI * 2;
-  return delta;
-}}
-
-function stopInertialSpin() {{
-  if (spinStartTimeoutId !== null) {{
-    clearTimeout(spinStartTimeoutId);
-    spinStartTimeoutId = null;
-  }}
-  if (spinFrameId !== null) {{
-    cancelAnimationFrame(spinFrameId);
-    spinFrameId = null;
-  }}
-}}
-
-function startInertialSpin(initialAngularVelocity) {{
-  if (!isRotateMode()) return;
-  stopInertialSpin();
-  let angularVelocity = clamp(initialAngularVelocity, -SPIN_MAX_VELOCITY, SPIN_MAX_VELOCITY);
-  if (Math.abs(angularVelocity) < SPIN_MIN_START_VELOCITY) return;
-  let lastFrameTime = performance.now();
-
-  function step(now) {{
-    if (!isRotateMode()) {{
-      stopInertialSpin();
-      return;
-    }}
-    const dt = Math.min(32, Math.max(1, now - lastFrameTime));
-    lastFrameTime = now;
-    const camera = rotateCameraAroundZ(currentSceneCamera(), angularVelocity * dt);
-    Plotly.relayout('umap-plot', {{ 'scene.camera': camera }});
-    angularVelocity *= Math.exp(-dt / SPIN_DECAY_MS);
-    if (Math.abs(angularVelocity) > SPIN_STOP_VELOCITY) {{
-      spinFrameId = requestAnimationFrame(step);
-    }} else {{
-      spinFrameId = null;
-    }}
-  }}
-
-  spinFrameId = requestAnimationFrame(step);
-}}
-
-plot.addEventListener('pointerdown', ev => {{
-  if (!isRotateMode()) return;
-  stopInertialSpin();
-  const now = performance.now();
-  rotatePointerState = {{
-    active: true,
-    startTime: now,
-    startAngle: cameraAzimuth(currentSceneCamera()),
-  }};
-}}, true);
-
-function finishRotatePointer() {{
-  if (!rotatePointerState.active) return;
-  spinStartTimeoutId = setTimeout(() => {{
-    spinStartTimeoutId = null;
-    const now = performance.now();
-    const endAngle = cameraAzimuth(currentSceneCamera());
-    const angle = angleDelta(endAngle, rotatePointerState.startAngle);
-    const dragDuration = now - rotatePointerState.startTime;
-    const angularVelocity = angle / Math.max(1, dragDuration);
-    rotatePointerState.active = false;
-    if (Math.abs(angle) >= SPIN_MIN_DRAG_ANGLE && dragDuration >= SPIN_MIN_DRAG_MS) {{
-      startInertialSpin(angularVelocity);
-    }}
-  }}, SPIN_SETTLE_DELAY_MS);
-}}
-
-window.addEventListener('pointerup', finishRotatePointer, true);
-window.addEventListener('pointercancel', () => {{
-  rotatePointerState.active = false;
-  stopInertialSpin();
-}}, true);
 
 plot.on('plotly_click', ev => {{
   if (!ev || !ev.points || !ev.points.length) return;

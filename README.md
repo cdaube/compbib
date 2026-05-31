@@ -1,16 +1,16 @@
-# CogNeuro Explorer
+# CompBib
 
-Interactive browser of cognitive neuroscience and neuroimaging abstracts (1980-2025).
+Computational bibliography tools for mapping research literature with embeddings, UMAP projections, and citation metadata.
 
-**Explore the live map here: [https://cdaube.github.io/cogneuro/](https://cdaube.github.io/cogneuro/)**
+**Project site: [https://cdaube.github.io/compbib/](https://cdaube.github.io/compbib/)**
 
-**Glasgow Research Explorer: [https://cdaube.github.io/cogneuro/glasgow_explorer.html](https://cdaube.github.io/cogneuro/glasgow_explorer.html)**
+**Glasgow Imaging Initiative Explorer: [https://cdaube.github.io/compbib/glasgow_imaging_initiative_explorer.html](https://cdaube.github.io/compbib/glasgow_imaging_initiative_explorer.html)**
 
-*These tools use LLM embeddings and UMAP to visualize the semantic landscape of research abstracts. The Glasgow explorer maps ~13k evidence-filtered works from University of Glasgow researchers, coloured by school, college, year, or citation network.*
+These tools use LLM embeddings and UMAP to visualize the semantic landscape of research abstracts. The Glasgow Imaging Initiative Explorer maps ~13k evidence-filtered works from University of Glasgow researchers, coloured by school, college, year, or citation network.
 
-## Glasgow Scraping Pipeline
+## Glasgow Imaging Initiative Pipeline
 
-The Glasgow explorer starts from `data/MVLS Imaging Initiative List of Academics.xlsx`, which defines the researcher roster, school, and college labels. The scraper keeps this spreadsheet as the roster of people to include; it does not scrape all Glasgow staff automatically.
+The Glasgow Imaging Initiative Explorer starts from `data/MVLS Imaging Initiative List of Academics.xlsx`, which defines the researcher roster, school, and college labels. The scraper keeps this spreadsheet as the roster of people to include; it does not scrape all Glasgow staff automatically.
 
 The main scraper is:
 
@@ -38,4 +38,10 @@ uv run python scripts/enrich_glasgow_citation_graph.py
 uv run python scripts/build_glasgow_explorer_data.py --force
 ```
 
-The final command recomputes embeddings, the 10 UMAP projections, and `glasgow_explorer.html`.
+The final command recomputes embeddings, the 10 UMAP projections, `glasgow_imaging_initiative_explorer.html`, and the legacy `glasgow_explorer.html` URL.
+
+To rebuild only the HTML from existing cached data, run:
+
+```bash
+uv run python scripts/make_glasgow_imaging_initiative_explorer.py
+```

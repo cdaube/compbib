@@ -367,7 +367,7 @@ wheels = [
 ]
 
 [[package]]
-name = "cogneuro"
+name = "compbib"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
